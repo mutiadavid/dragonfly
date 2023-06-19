@@ -1,11 +1,12 @@
-name: ci-tests
+name: Daily Coverage
 
 on:
-  # push:
-  # branches: [ main ]
-  # pull_request:
-  #   branches: [main]
-  workflow_dispatch:
+    pull_request:
+        branches: [main]
+    # TODO: Remove this. This is for testing
+    schedule:
+      - cron: '0 6 * * *' # run at 6 AM UTC
+    workflow_dispatch:
 
 jobs:
   pre-commit:
@@ -34,16 +35,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # Test of these containers
-        container: ["ubuntu-dev:20", "alpine-dev:latest"]
-        build-type: [Debug, Release]
-        compiler: [{cxx: g++, c: gcc}]
-        cxx_flags: ["-Werror"]
         include:
-          - container: "alpine-dev:latest"
+          - container: "ubuntu-dev:20"
             build-type: Debug
-            compiler: {cxx: clang++, c: clang}
-            cxx_flags: ""
+            compiler: {cxx: g++, c: gcc}
+            cxx_flags: "-fprofile-arcs -ftest-coverage"
     timeout-minutes: 30
     container:
       image: ghcr.io/romange/${{ matrix.container }}
@@ -60,9 +56,7 @@ jobs:
           uname -a
           cmake --version
           mkdir -p ${{github.workspace}}/build
-          if [ "${{matrix.compiler.c}}" = "clang" ]; then
-            apk update && apk add clang
-          fi
+          apt update && apt install -y lcov pip
       - name: Cache build deps
         id: cache-deps
         uses: actions/cache@v3
@@ -78,6 +72,7 @@ jobs:
         # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
         # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
         run: |
+          pip install -r tests/dragonfly/requirements.txt
           cmake -B ${{github.workspace}}/build \
             -DCMAKE_BUILD_TYPE=${{matrix.build-type}} \
             -GNinja \
@@ -89,69 +84,33 @@ jobs:
           cd ${{github.workspace}}/build && pwd
           du -hcs _deps/
       - name: Build & Test
+        id: cov_gen
         run: |
+          # TODO: run epoll as well.
           cd ${{github.workspace}}/build
-          ninja src/all
+          ninja io_test
           ccache --show-stats
-          echo Run ctest -V -L DFLY
-          #GLOG_logtostderr=1 GLOG_vmodule=transaction=1,engine_shard_set=1
-          GLOG_logtostderr=1 GLOG_vmodule=rdb_load=1,rdb_save=1,snapshot=1 ctest -V -L DFLY
-          ./dragonfly_test  --gtest_repeat=10
-          ./multi_test --multi_exec_mode=2 --gtest_repeat=10
-          ./multi_test --multi_exec_mode=3 --gtest_repeat=10
-          # GLOG_logtostderr=1 GLOG_vmodule=transaction=1,engine_shard_set=1 CTEST_OUTPUT_ON_FAILURE=1 ninja server/test
-  lint-test-chart:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+          ./io_test
+          #   ninja test
+
+          ls -l ${GITHUB_WORKSPACE}/
+          cd ${GITHUB_WORKSPACE}/tests
+          export DRAGONFLY_PATH="${{github.workspace}}/build/dragonfly"
+          # pytest dragonfly -k flushall
+
+          cd ${{github.workspace}}/build
+          lcov -c -d . -o main_coverage.info
+          lcov --remove main_coverage.info -o main_coverage.info '/usr/*' '*/_deps/*' '*/third_party/*'
+          genhtml main_coverage.info --ignore-errors source --output-directory out -p ${{github.workspace}}
+          tar -czf cov.tar.gz out
+          ls -lh cov.tar.gz
+          export covFile=`realpath cov.tar.gz`
+
+          echo "cov=$covFile" >> $GITHUB_OUTPUT
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v3
         with:
-          fetch-depth: 0
-
-      - name: Set up Helm
-        uses: azure/setup-helm@v3
-
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-          check-latest: true
-
-      - name: Chart Rendering Tests
-        run: |
-          go test -v ./contrib/charts/dragonfly/...
-
-      - name: Set up chart-testing
-        uses: helm/chart-testing-action@v2.3.1
-
-      - name: Run chart-testing (list-changed)
-        id: list-changed
-        run: |
-          changed=$(ct list-changed --config .ct.yaml)
-          if [[ -n "$changed" ]]; then
-            echo "::set-output name=changed::true"
-          fi
-
-      - name: Run chart-testing (lint)
-        run: |
-          ct \
-            lint \
-            --config .ct.yaml \
-            ${{github.event_name == 'workflow_dispatch' && '--all'}} ;
-
-      - if: steps.list-changed.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        name: Create kind cluster
-        uses: helm/kind-action@v1.5.0
-
-      - if: steps.list-changed.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        name: Getting cluster ready
-        run: |
-          kubectl label nodes chart-testing-control-plane key/node-kind=high-memory
-
-      - name: Run chart-testing (install)
-        run: |
-          ct \
-            install \
-            --config .ct.yaml \
-            --debug \
-            --helm-extra-set-args "--set=image.repository=ghcr.io/${{ github.repository }},probes=null" \
-            ${{github.event_name == 'workflow_dispatch' && '--all'}} ;
+          name: coverage-report
+          path: ${{ steps.cov_gen.outputs.cov }}
+          if-no-files-found: error
