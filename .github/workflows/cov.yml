@@ -33,6 +33,8 @@ jobs:
     # cross-platform coverage.
     # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
     runs-on: ubuntu-latest
+    outputs:
+      cov: ${{ steps.cov_gen.outputs.path }}
     strategy:
       matrix:
         include:
@@ -104,13 +106,13 @@ jobs:
           genhtml main_coverage.info --ignore-errors source --output-directory out -p ${{github.workspace}}
           tar -czf cov.tar.gz out
           ls -lh cov.tar.gz
-          export covFile=`realpath cov.tar.gz`
+          #export covFile=`realpath cov.tar.gz`
 
-          echo "cov=$covFile" >> $GITHUB_OUTPUT
+          echo "path=${{github.workspace}}/build/cov.tar.gz" >> $GITHUB_OUTPUT
 
       - name: Upload coverage
         uses: actions/upload-artifact@v3
         with:
           name: coverage-report
-          path: ${{ steps.cov_gen.outputs.cov }}
+          path: ${{ steps.cov_gen.outputs.cov.path }}
           if-no-files-found: error
