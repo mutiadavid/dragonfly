@@ -115,5 +115,5 @@ jobs:
         uses: actions/upload-artifact@v3
         with:
           name: coverage-report
-          path: ${{ steps.cov_gen.outputs.cov }}
+          path: ${{ steps.cov_gen.outputs.covFile }}
           if-no-files-found: error
