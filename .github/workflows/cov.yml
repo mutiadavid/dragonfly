@@ -114,5 +114,5 @@ jobs:
         uses: actions/upload-artifact@v3
         with:
           name: coverage-report
-          path: build/cov.tar.gz
+          path: cov.tar.gz
           if-no-files-found: error
