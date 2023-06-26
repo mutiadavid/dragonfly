@@ -104,16 +104,16 @@ jobs:
           lcov -c -d . -o main_coverage.info
           lcov --remove main_coverage.info -o main_coverage.info '/usr/*' '*/_deps/*' '*/third_party/*'
           genhtml main_coverage.info --ignore-errors source --output-directory out -p ${{github.workspace}}
-          tar -czf cov.tar.gz out
-          ls -lh cov.tar.gz
+          tar -czf ${{github.workspace}}/coverage.tar.gz out
+          ls -lh ${{github.workspace}}/coverage.tar.gz
           pwd
-          #export covFile=`realpath cov.tar.gz`
+          export covFile=`realpath ${{github.workspace}}/coverage.tar.gz`
 
-          echo "path=${{github.workspace}}/build/cov.tar.gz" >> $GITHUB_OUTPUT
+          echo "path=${{github.workspace}}/coverage.tar.gz" >> $GITHUB_OUTPUT
 
       - name: Upload coverage
         uses: actions/upload-artifact@v3
         with:
           name: coverage-report
-          path: "/build/cov.tar.gz"
+          path: ${{ steps.cov_gen.outputs.cov }}
           if-no-files-found: error
