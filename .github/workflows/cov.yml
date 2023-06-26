@@ -112,7 +112,7 @@ jobs:
           echo "path=${{github.workspace}}/coverage.tar.gz" >> $GITHUB_OUTPUT
 
       - name: Upload coverage
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v2
         with:
           name: coverage-report
           path: /home/runner/work/dragonfly/dragonfly/coverage.tar.gz
