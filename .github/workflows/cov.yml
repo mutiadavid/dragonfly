@@ -115,5 +115,5 @@ jobs:
         uses: actions/upload-artifact@v2
         with:
           name: coverage-report
-          path: /home/runner/work/dragonfly/dragonfly/coverage.tar.gz
+          path: /home/runner/work/dragonfly/coverage.tar.gz
           if-no-files-found: error
