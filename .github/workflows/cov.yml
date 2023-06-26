@@ -106,6 +106,7 @@ jobs:
           genhtml main_coverage.info --ignore-errors source --output-directory out -p ${{github.workspace}}
           tar -czf cov.tar.gz out
           ls -lh cov.tar.gz
+          pwd
           #export covFile=`realpath cov.tar.gz`
 
           echo "path=${{github.workspace}}/build/cov.tar.gz" >> $GITHUB_OUTPUT
