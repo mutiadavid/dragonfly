@@ -55,7 +55,7 @@ class TestRdbSnapshot(SnapshotTestBase):
         assert await async_client.flushall()
         await async_client.execute_command("DEBUG LOAD " + super().get_main_file("test-rdb-*.rdb"))
 
-        assert await seeder.compare(start_capture)
+        assert await seeder.compare(start_capture, port=df_server.port)
 
 
 @dfly_args({**BASIC_ARGS, "dbfilename": "test-rdbexact.rdb", "nodf_snapshot_format": None})
@@ -79,7 +79,7 @@ class TestRdbSnapshotExactFilename(SnapshotTestBase):
         main_file = super().get_main_file("test-rdbexact.rdb")
         await async_client.execute_command("DEBUG LOAD " + main_file)
 
-        assert await seeder.compare(start_capture)
+        assert await seeder.compare(start_capture, port=df_server.port)
 
 
 @dfly_args({**BASIC_ARGS, "dbfilename": "test-dfs"})
@@ -104,7 +104,7 @@ class TestDflySnapshot(SnapshotTestBase):
             "DEBUG LOAD " + super().get_main_file("test-dfs-summary.dfs")
         )
 
-        assert await seeder.compare(start_capture)
+        assert await seeder.compare(start_capture, port=df_server.port)
 
 
 # We spawn instances manually, so reduce memory usage of default to minimum
@@ -230,7 +230,7 @@ class TestDflySnapshotOnShutdown(SnapshotTestBase):
         await wait_available_async(a_client)
         await a_client.connection_pool.disconnect()
 
-        assert await seeder.compare(start_capture)
+        assert await seeder.compare(start_capture, port=df_server.port)
 
 
 @dfly_args({**BASIC_ARGS, "dbfilename": "test-info-persistence"})
