@@ -2,9 +2,10 @@
 // See LICENSE for licensing terms.
 //
 
-#include <absl/container/btree_map.h>
 #include <absl/container/btree_set.h>
 #include <mimalloc.h>
+
+#include <random>
 
 #include "base/gtest.h"
 #include "base/logging.h"
@@ -57,11 +58,21 @@ TEST_F(SortedMapTest, MemoryUsage) {
   MiMemoryResource mi_alloc(mi_heap_get_backing());
   using AllocType = PMR_NS::polymorphic_allocator<std::pair<double, sds>>;
   AllocType alloc(&mi_alloc);
-  absl::btree_set<pair<double, sds>, std::greater<pair<double, sds>>, AllocType> btree(alloc);
+  // absl::btree_set<pair<double, sds>, std::greater<pair<double, sds>>, AllocType> btree(alloc);
+  using BtreeParams = absl::lts_20230125::container_internal::set_params<
+      std::pair<double, char*>, std::greater<std::pair<double, char*>>,
+      std::pmr::polymorphic_allocator<std::pair<double, char*>>, 256, false>;
 
+  absl::btree_set<uint64_t, std::less<uint64_t>, AllocType> btree(alloc);
+  /*absl::lts_202301257::container_internal::btree_set_container<
+          container_internal::btree<BtreeParams>> btree(alloc);*/
+
+  BtreeParams params;
+  constexpr unsigned kFoo = BtreeParams::kTargetNodeSize;
+  BtreeParams::slot_type slot;
   LOG(INFO) << "btree before: " << mi_alloc.used() << " bytes";
-  for (size_t i = 0; i < sds_vec.size(); ++i) {
-    btree.emplace(i, sds_vec[i]);
+  for (size_t i = 0; i < 256; ++i) {
+    btree.emplace(i);
   }
   LOG(INFO) << "btree after: " << mi_alloc.used() << " bytes";
 }
