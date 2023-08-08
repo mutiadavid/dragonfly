@@ -89,7 +89,7 @@ jobs:
         id: cov_gen
         run: |
           # TODO: run epoll as well.
-          cd ${{github.workspace}}/build
+          cd $GITHUB_WORKSPACE/build
           ninja io_test
           ccache --show-stats
           ./io_test
@@ -100,20 +100,17 @@ jobs:
           export DRAGONFLY_PATH="${{github.workspace}}/build/dragonfly"
           # pytest dragonfly -k flushall
 
-          cd ${{github.workspace}}/build
+          cd $GITHUB_WORKSPACE/build
+
           lcov -c -d . -o main_coverage.info
           lcov --remove main_coverage.info -o main_coverage.info '/usr/*' '*/_deps/*' '*/third_party/*'
-          genhtml main_coverage.info --ignore-errors source --output-directory out -p ${{github.workspace}}
-          tar -czf ${{github.workspace}}/coverage.tar.gz out
-          ls -lh ${{github.workspace}}/coverage.tar.gz
-          pwd
-          export covFile=`realpath ${{github.workspace}}/coverage.tar.gz`
-
-          echo "path=${{github.workspace}}/coverage.tar.gz" >> $GITHUB_OUTPUT
-
+          genhtml main_coverage.info --ignore-errors source --output-directory covout -p $GITHUB_WORKSPACE
+          ls ./
+          echo ls covout
+          ls covout/
       - name: Upload coverage
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: coverage-report
-          path: /home/runner/work/dragonfly/coverage.tar.gz
+          path: build/covout/
           if-no-files-found: error
