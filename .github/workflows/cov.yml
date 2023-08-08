@@ -89,7 +89,7 @@ jobs:
         id: cov_gen
         run: |
           # TODO: run epoll as well.
-          cd $GITHUB_WORKSPACE/build
+          cd ${{github.workspace}}/build
           ninja io_test
           ccache --show-stats
           ./io_test
@@ -100,7 +100,7 @@ jobs:
           export DRAGONFLY_PATH="${{github.workspace}}/build/dragonfly"
           # pytest dragonfly -k flushall
 
-          cd $GITHUB_WORKSPACE/build
+          cd ${{github.workspace}}/build
 
           lcov -c -d . -o main_coverage.info
           lcov --remove main_coverage.info -o main_coverage.info '/usr/*' '*/_deps/*' '*/third_party/*'
