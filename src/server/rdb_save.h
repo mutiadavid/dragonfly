@@ -69,6 +69,12 @@ enum class CompressionMode { NONE, SINGLE_ENTRY, MULTY_ENTRY_ZSTD, MULTY_ENTRY_L
 
 class RdbSaver {
  public:
+  // Global data which doesn't belong to shards and is serialized in header
+  struct GlobalData {
+    const StringVec lua_scripts;     // bodies of lua scripts
+    const StringVec search_indices;  // ft.create commands to re-create search indices
+  };
+
   // single_shard - true means that we run RdbSaver on a single shard and we do not use
   // to snapshot all the datastore shards.
   // single_shard - false, means we capture all the data using a single RdbSaver instance
@@ -82,16 +88,19 @@ class RdbSaver {
   // TODO: to implement break functionality to allow stopping early.
   void StartSnapshotInShard(bool stream_journal, const Cancellation* cll, EngineShard* shard);
 
+  // Send only the incremental snapshot since start_lsn.
+  void StartIncrementalSnapshotInShard(Context* cntx, EngineShard* shard, LSN start_lsn);
+
   // Stops serialization in journal streaming mode in the shard's thread.
   void StopSnapshotInShard(EngineShard* shard);
 
-  // Stores auxiliary (meta) values and lua scripts.
-  std::error_code SaveHeader(const StringVec& lua_scripts);
+  // Stores auxiliary (meta) values and header_info
+  std::error_code SaveHeader(const GlobalData& header_info);
 
   // Writes the RDB file into sink. Waits for the serialization to finish.
   // Fills freq_map with the histogram of rdb types.
   // freq_map can optionally be null.
-  std::error_code SaveBody(const Cancellation* cll, RdbTypeFreqMap* freq_map);
+  std::error_code SaveBody(Context* cntx, RdbTypeFreqMap* freq_map);
 
   void Cancel();
 
@@ -99,12 +108,16 @@ class RdbSaver {
     return save_mode_;
   }
 
+  // Can only be called for dragonfly replication.
+  // Get total size of all rdb serializer buffers and items currently placed in channel
+  size_t GetTotalBuffersSize() const;
+
  private:
   class Impl;
 
   std::error_code SaveEpilog();
 
-  std::error_code SaveAux(const StringVec& lua_scripts);
+  std::error_code SaveAux(const GlobalData&);
   std::error_code SaveAuxFieldStrInt(std::string_view key, int64_t val);
 
   std::unique_ptr<Impl> impl_;
@@ -116,7 +129,7 @@ class CompressorImpl;
 
 class RdbSerializer {
  public:
-  RdbSerializer(CompressionMode compression_mode);
+  explicit RdbSerializer(CompressionMode compression_mode);
 
   ~RdbSerializer();
 
@@ -152,12 +165,14 @@ class RdbSerializer {
   }
 
   // Write journal entry as an embedded journal blob.
-  std::error_code WriteJournalEntry(const journal::Entry& entry);
+  std::error_code WriteJournalEntry(std::string_view entry);
 
   std::error_code SendJournalOffset(uint64_t journal_offset);
 
   // Send FULL_SYNC_CUT opcode to notify that all static data was sent.
   std::error_code SendFullSyncCut();
+
+  size_t GetTotalBufferCapacity() const;
 
  private:
   // Prepare internal buffer for flush. Compress it.
@@ -182,7 +197,6 @@ class RdbSerializer {
   void AllocateCompressorOnce();
 
   base::IoBuf mem_buf_;
-  base::IoBuf journal_mem_buf_;
   std::string tmp_str_;
   base::PODArray<uint8_t> tmp_buf_;
   DbIndex last_entry_db_index_ = kInvalidDbId;

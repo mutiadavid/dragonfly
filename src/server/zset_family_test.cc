@@ -51,6 +51,18 @@ TEST_F(ZSetFamilyTest, Add) {
   EXPECT_EQ(0.79028573343077946, 0.7902857334307795);
 }
 
+TEST_F(ZSetFamilyTest, AddNonUniqeMembers) {
+  auto resp = Run({"zadd", "x", "2", "a", "1", "a"});
+  EXPECT_THAT(resp, IntArg(1));
+
+  resp = Run({"zscore", "x", "a"});
+  EXPECT_EQ(resp, "1");
+
+  resp = Run({"zadd", "y", "3", "a", "1", "a", "2", "b"});
+  EXPECT_THAT(resp, IntArg(2));
+  EXPECT_EQ("1", Run({"zscore", "y", "a"}));
+}
+
 TEST_F(ZSetFamilyTest, ZRem) {
   auto resp = Run({"zadd", "x", "1.1", "b", "2.1", "a"});
   EXPECT_THAT(resp, IntArg(2));
@@ -104,6 +116,19 @@ TEST_F(ZSetFamilyTest, ZRangeRank) {
   EXPECT_EQ(0, CheckedInt({"zrevrank", "x", "b"}));
   EXPECT_THAT(Run({"zrevrank", "x", "c"}), ArgType(RespExpr::NIL));
   EXPECT_THAT(Run({"zrank", "y", "c"}), ArgType(RespExpr::NIL));
+}
+
+TEST_F(ZSetFamilyTest, LargeSet) {
+  for (int i = 0; i < 129; ++i) {
+    auto resp = Run({"zadd", "key", absl::StrCat(i), absl::StrCat("element:", i)});
+    EXPECT_THAT(resp, IntArg(1)) << i;
+  }
+  Run({"zadd", "key", "129", ""});
+
+  EXPECT_THAT(Run({"zrangebyscore", "key", "(-inf", "(0.0"}), ArrLen(0));
+  EXPECT_THAT(Run({"zrangebyscore", "key", "(5", "0.0"}), ArrLen(0));
+  EXPECT_THAT(Run({"zrangebylex", "key", "-", "(element:0"}), ArrLen(0));
+  EXPECT_EQ(2, CheckedInt({"zremrangebyscore", "key", "127", "(129"}));
 }
 
 TEST_F(ZSetFamilyTest, ZRemRangeRank) {
@@ -170,6 +195,11 @@ TEST_F(ZSetFamilyTest, ZRevRangeByLex) {
   resp = Run({"zrevrangebylex", "key", "+", "[a"});
   ASSERT_THAT(resp, ArgType(RespExpr::ARRAY));
   ASSERT_THAT(resp.GetVec(), ElementsAre("foo", "elephant", "down", "cool", "bar", "alpha"));
+
+  Run({"zadd", "myzset", "0", "a", "0", "b", "0", "c", "0", "d", "0", "e", "0", "f", "0", "g"});
+  resp = Run({"zrevrangebylex", "myzset", "(c", "-"});
+  ASSERT_THAT(resp, ArgType(RespExpr::ARRAY));
+  EXPECT_THAT(resp.GetVec(), ElementsAre("b", "a"));
 }
 
 TEST_F(ZSetFamilyTest, ZRange) {
@@ -292,7 +322,7 @@ TEST_F(ZSetFamilyTest, ZUnionError) {
   EXPECT_THAT(resp, ErrArg("wrong number of arguments"));
 
   resp = Run({"zunion", "0", "myset"});
-  EXPECT_THAT(resp, ErrArg("syntax error"));
+  EXPECT_THAT(resp, ErrArg("at least 1 input key is needed"));
 
   resp = Run({"zunion", "3", "z1", "z2", "z3", "weights", "1", "1", "k"});
   EXPECT_THAT(resp, ErrArg("weight value is not a float"));
@@ -372,7 +402,7 @@ TEST_F(ZSetFamilyTest, ZUnionStore) {
   EXPECT_THAT(resp, ErrArg("wrong number of arguments"));
 
   resp = Run({"zunionstore", "key", "0", "aggregate"});
-  EXPECT_THAT(resp, ErrArg("syntax error"));
+  EXPECT_THAT(resp, ErrArg("at least 1 input key is needed"));
 
   resp = Run({"zunionstore", "key", "0", "aggregate", "sum"});
   EXPECT_THAT(resp, ErrArg("at least 1 input key is needed"));
@@ -446,10 +476,11 @@ TEST_F(ZSetFamilyTest, ZInterStore) {
 TEST_F(ZSetFamilyTest, ZInterCard) {
   EXPECT_EQ(3, CheckedInt({"zadd", "z1", "1", "a", "2", "b", "3", "c"}));
   EXPECT_EQ(3, CheckedInt({"zadd", "z2", "2", "b", "3", "c", "4", "d"}));
-  RespExpr resp;
 
   EXPECT_EQ(2, CheckedInt({"zintercard", "2", "z1", "z2"}));
   EXPECT_EQ(1, CheckedInt({"zintercard", "2", "z1", "z2", "LIMIT", "1"}));
+
+  RespExpr resp;
 
   resp = Run({"zintercard", "2", "z1", "z2", "LIM"});
   EXPECT_THAT(resp, ErrArg("syntax error"));
@@ -457,6 +488,9 @@ TEST_F(ZSetFamilyTest, ZInterCard) {
   EXPECT_THAT(resp, ErrArg("syntax error"));
   resp = Run({"zintercard", "2", "z1", "z2", "LIMIT", "a"});
   EXPECT_THAT(resp, ErrArg("limit value is not a positive integer"));
+
+  resp = Run({"zintercard", "0", "z1"});
+  EXPECT_THAT(resp, ErrArg("at least 1 input"));
 
   // support for sets
   EXPECT_EQ(3, CheckedInt({"sadd", "s2", "b", "c", "d"}));
@@ -602,10 +636,10 @@ TEST_F(ZSetFamilyTest, ZDiffError) {
   EXPECT_THAT(resp, ErrArg("wrong number of arguments"));
 
   resp = Run({"zdiff", "0", "z1"});
-  EXPECT_THAT(resp, ErrArg("value is not an integer or out of range"));
+  EXPECT_THAT(resp, ErrArg("at least 1 input key is needed"));
 
   resp = Run({"zdiff", "0", "z1", "z2"});
-  EXPECT_THAT(resp, ErrArg("value is not an integer or out of range"));
+  EXPECT_THAT(resp, ErrArg("at least 1 input key is needed"));
 }
 
 TEST_F(ZSetFamilyTest, ZDiff) {
@@ -643,6 +677,16 @@ TEST_F(ZSetFamilyTest, ZDiff) {
 
   resp = Run({"zdiff", "2", "z1", "z2", "WITHSCORES"});
   EXPECT_THAT(resp.GetVec(), ElementsAre("two", "2", "three", "3", "four", "4"));
+}
+
+TEST_F(ZSetFamilyTest, Count) {
+  for (int i = 0; i < 129; ++i) {
+    auto resp = Run({"zadd", "key", absl::StrCat(i), absl::StrCat("element:", i)});
+    EXPECT_THAT(resp, IntArg(1)) << i;
+  }
+
+  EXPECT_THAT(CheckedInt({"zcount", "key", "-inf", "+inf"}), 129);
+  EXPECT_THAT(CheckedInt({"zlexcount", "key", "-", "+"}), 129);
 }
 
 TEST_F(ZSetFamilyTest, GeoAdd) {

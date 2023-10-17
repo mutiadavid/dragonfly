@@ -4,6 +4,8 @@
 
 #include "server/rdb_load.h"
 
+#include "absl/strings/escaping.h"
+
 extern "C" {
 
 #include "redis/intset.h"
@@ -19,6 +21,7 @@ extern "C" {
 #include <absl/cleanup/cleanup.h>
 #include <absl/strings/match.h>
 #include <absl/strings/str_cat.h>
+#include <absl/strings/str_split.h>
 #include <lz4frame.h>
 #include <zstd.h>
 
@@ -558,7 +561,7 @@ void RdbLoaderBase::OpaqueObjLoader::CreateHMap(const LoadTrace* ltrace) {
   size_t len = ltrace->blob_count() / 2;
 
   /* Too many entries? Use a hash table right from the start. */
-  bool keep_lp = (len <= server.hash_max_listpack_entries);
+  bool keep_lp = (len <= 64);
 
   size_t lp_size = 0;
   if (keep_lp) {
@@ -566,7 +569,7 @@ void RdbLoaderBase::OpaqueObjLoader::CreateHMap(const LoadTrace* ltrace) {
       size_t str_len = StrLen(blob.rdb_var);
       lp_size += str_len;
 
-      if (str_len > server.hash_max_listpack_value) {
+      if (str_len > server.max_map_field_len) {
         keep_lp = false;
         return false;
       }
@@ -696,7 +699,7 @@ void RdbLoaderBase::OpaqueObjLoader::CreateList(const LoadTrace* ltrace) {
 
 void RdbLoaderBase::OpaqueObjLoader::CreateZSet(const LoadTrace* ltrace) {
   size_t zsetlen = ltrace->blob_count();
-  detail::SortedMap* zs = new detail::SortedMap;
+  detail::SortedMap* zs = new detail::SortedMap(CompactObj::memory_resource());
   unsigned encoding = OBJ_ENCODING_SKIPLIST;
   auto cleanup = absl::MakeCleanup([&] { delete zs; });
 
@@ -968,7 +971,7 @@ void RdbLoaderBase::OpaqueObjLoader::HandleBlob(string_view blob) {
       return;
     }
 
-    if (lpBytes(lp) > HSetFamily::MaxListPackLen()) {
+    if (lpBytes(lp) > server.max_listpack_map_bytes) {
       StringMap* sm = HSetFamily::ConvertToStrMap(lp);
       lpFree(lp);
       pv_->InitRobj(OBJ_HASH, kEncodingStrMap2, sm);
@@ -994,8 +997,8 @@ void RdbLoaderBase::OpaqueObjLoader::HandleBlob(string_view blob) {
 
     unsigned encoding = OBJ_ENCODING_LISTPACK;
     void* inner;
-    if (lpBytes(lp) > server.zset_max_listpack_entries) {
-      inner = detail::SortedMap::FromListPack(lp).release();
+    if (lpBytes(lp) >= server.max_listpack_map_bytes) {
+      inner = detail::SortedMap::FromListPack(CompactObj::memory_resource(), lp).release();
       lpFree(lp);
       encoding = OBJ_ENCODING_SKIPLIST;
     } else {
@@ -1494,7 +1497,7 @@ auto RdbLoaderBase::ReadGeneric(int rdbtype) -> io::Result<OpaqueObj> {
 }
 
 auto RdbLoaderBase::ReadHMap() -> io::Result<OpaqueObj> {
-  uint64_t len;
+  size_t len;
   SET_OR_UNEXPECT(LoadLen(nullptr), len);
 
   if (len == 0)
@@ -1505,7 +1508,7 @@ auto RdbLoaderBase::ReadHMap() -> io::Result<OpaqueObj> {
   len *= 2;
   load_trace->arr.resize((len + kMaxBlobLen - 1) / kMaxBlobLen);
   for (size_t i = 0; i < load_trace->arr.size(); ++i) {
-    size_t n = std::min(len, kMaxBlobLen);
+    size_t n = std::min<size_t>(len, kMaxBlobLen);
     load_trace->arr[i].resize(n);
     for (size_t j = 0; j < n; ++j) {
       error_code ec = ReadStringObj(&load_trace->arr[i][j].rdb_var);
@@ -1532,7 +1535,7 @@ auto RdbLoaderBase::ReadZSet(int rdbtype) -> io::Result<OpaqueObj> {
   double score;
 
   for (size_t i = 0; i < load_trace->arr.size(); ++i) {
-    size_t n = std::min(zsetlen, kMaxBlobLen);
+    size_t n = std::min<size_t>(zsetlen, kMaxBlobLen);
     load_trace->arr[i].resize(n);
     for (size_t j = 0; j < n; ++j) {
       error_code ec = ReadStringObj(&load_trace->arr[i][j].rdb_var);
@@ -1580,7 +1583,7 @@ auto RdbLoaderBase::ReadListQuicklist(int rdbtype) -> io::Result<OpaqueObj> {
   load_trace->arr.resize((len + kMaxBlobLen - 1) / kMaxBlobLen);
 
   for (size_t i = 0; i < load_trace->arr.size(); ++i) {
-    size_t n = std::min(len, kMaxBlobLen);
+    size_t n = std::min<size_t>(len, kMaxBlobLen);
     load_trace->arr[i].resize(n);
     for (size_t j = 0; j < n; ++j) {
       uint64_t container = QUICKLIST_NODE_CONTAINER_PACKED;
@@ -1840,6 +1843,7 @@ error_code RdbLoader::Load(io::Source* src) {
     auto cb = mem_buf_->InputBuffer();
 
     if (memcmp(cb.data(), "REDIS", 5) != 0) {
+      VLOG(1) << "Bad header: " << absl::CHexEscape(facade::ToSV(cb));
       return RdbError(errc::wrong_signature);
     }
 
@@ -2146,20 +2150,28 @@ error_code RdbLoaderBase::HandleJournalBlob(Service* service) {
   while (done < num_entries) {
     journal::ParsedEntry entry{};
     SET_OR_RETURN(journal_reader_.ReadEntry(), entry);
+    done++;
 
-    if (!entry.cmd.cmd_args.empty()) {
-      if (absl::EqualsIgnoreCase(facade::ToSV(entry.cmd.cmd_args[0]), "FLUSHALL") ||
-          absl::EqualsIgnoreCase(facade::ToSV(entry.cmd.cmd_args[0]), "FLUSHDB")) {
-        // Applying a flush* operation in the middle of a load can cause out-of-sync deletions of
-        // data that should not be deleted, see https://github.com/dragonflydb/dragonfly/issues/1231
-        // By returning an error we are effectively restarting the replication.
-        return RdbError(errc::unsupported_operation);
-      }
+    // EXEC entries are just for preserving atomicity of transactions. We don't create
+    // transactions and we don't care about atomicity when we're loading an RDB, so skip them.
+    // Currently rdb_save also filters those records out, but we filter them additionally here
+    // for better forward compatibility if we decide to change that.
+    if (entry.opcode == journal::Op::EXEC)
+      continue;
+
+    if (entry.cmd.cmd_args.empty())
+      return RdbError(errc::rdb_file_corrupted);
+
+    if (absl::EqualsIgnoreCase(facade::ToSV(entry.cmd.cmd_args[0]), "FLUSHALL") ||
+        absl::EqualsIgnoreCase(facade::ToSV(entry.cmd.cmd_args[0]), "FLUSHDB")) {
+      // Applying a flush* operation in the middle of a load can cause out-of-sync deletions of
+      // data that should not be deleted, see https://github.com/dragonflydb/dragonfly/issues/1231
+      // By returning an error we are effectively restarting the replication.
+      return RdbError(errc::unsupported_operation);
     }
 
+    DVLOG(2) << "Executing item: " << entry.ToString();
     ex.Execute(entry.dbid, entry.cmd);
-    VLOG(1) << "Reading item: " << entry.ToString();
-    done++;
   }
 
   return std::error_code{};
@@ -2188,16 +2200,7 @@ error_code RdbLoader::HandleAux() {
   } else if (auxkey == "repl-offset") {
     // TODO
   } else if (auxkey == "lua") {
-    ServerState* ss = ServerState::tlocal();
-    auto interpreter = ss->BorrowInterpreter();
-    absl::Cleanup clean = [ss, interpreter]() { ss->ReturnInterpreter(interpreter); };
-
-    string_view body{auxval};
-    if (script_mgr_) {
-      auto res = script_mgr_->Insert(body, interpreter);
-      if (!res)
-        LOG(ERROR) << "Error compiling script";
-    }
+    LoadScriptFromAux(move(auxval));
   } else if (auxkey == "redis-ver") {
     VLOG(1) << "Loading RDB produced by version " << auxval;
   } else if (auxkey == "ctime") {
@@ -2220,6 +2223,8 @@ error_code RdbLoader::HandleAux() {
     }
   } else if (auxkey == "redis-bits") {
     /* Just ignored. */
+  } else if (auxkey == "search-index") {
+    LoadSearchIndexDefFromAux(move(auxval));
   } else {
     /* We ignore fields we don't understand, as by AUX field
      * contract. */
@@ -2274,9 +2279,16 @@ void RdbLoader::LoadItemsBuffer(DbIndex db_ind, const ItemsBuf& ib) {
     if (item->expire_ms > 0 && db_cntx.time_now_ms >= item->expire_ms)
       continue;
 
-    auto [it, added] = db_slice.AddOrUpdate(db_cntx, item->key, std::move(pv), item->expire_ms);
-    if (!added) {
-      LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind;
+    try {
+      auto [it, added] = db_slice.AddOrUpdate(db_cntx, item->key, std::move(pv), item->expire_ms);
+      if (!added) {
+        LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind;
+      }
+    } catch (const std::bad_alloc&) {
+      LOG(ERROR) << "OOM failed to add key '" << item->key << "' in DB " << db_ind;
+      ec_ = RdbError(errc::out_of_memory);
+      stop_early_ = true;
+      break;
     }
   }
 
@@ -2288,6 +2300,8 @@ void RdbLoader::LoadItemsBuffer(DbIndex db_ind, const ItemsBuf& ib) {
 void RdbLoader::ResizeDb(size_t key_num, size_t expire_num) {
   DCHECK_LT(key_num, 1U << 31);
   DCHECK_LT(expire_num, 1U << 31);
+  // Note: To reserve space, it's necessary to allocate space at the shard level. We might
+  // load with different number of shards which makes database resizing unfeasible.
 }
 
 error_code RdbLoader::LoadKeyValPair(int type, ObjSettings* settings) {
@@ -2319,7 +2333,7 @@ error_code RdbLoader::LoadKeyValPair(int type, ObjSettings* settings) {
    * assume to work in an exact keyspace state. */
 
   if (ServerState::tlocal()->is_master && settings->has_expired) {
-    VLOG(1) << "Expire key: " << item->key;
+    VLOG(2) << "Expire key: " << item->key;
     return kOk;
   }
 
@@ -2337,6 +2351,53 @@ error_code RdbLoader::LoadKeyValPair(int type, ObjSettings* settings) {
   }
 
   return kOk;
+}
+
+void RdbLoader::LoadScriptFromAux(string&& body) {
+  ServerState* ss = ServerState::tlocal();
+  auto interpreter = ss->BorrowInterpreter();
+  absl::Cleanup clean = [ss, interpreter]() { ss->ReturnInterpreter(interpreter); };
+
+  if (script_mgr_) {
+    auto res = script_mgr_->Insert(body, interpreter);
+    if (!res)
+      LOG(ERROR) << "Error compiling script";
+  }
+}
+
+void RdbLoader::LoadSearchIndexDefFromAux(string&& def) {
+  facade::CapturingReplyBuilder crb{};
+  ConnectionContext cntx{nullptr, nullptr, &crb};
+  cntx.journal_emulated = true;
+  cntx.skip_acl_validation = true;
+
+  absl::Cleanup cntx_clean = [&cntx] { cntx.Inject(nullptr); };
+
+  uint32_t consumed = 0;
+  facade::RespVec resp_vec;
+  facade::RedisParser parser;
+
+  def += "\r\n";  // RESP terminator
+  absl::Span<uint8_t> buffer{reinterpret_cast<uint8_t*>(def.data()), def.size()};
+  auto res = parser.Parse(buffer, &consumed, &resp_vec);
+
+  if (res != facade::RedisParser::Result::OK) {
+    LOG(ERROR) << "Bad index definition: " << def;
+    return;
+  }
+
+  CmdArgVec arg_vec;
+  facade::RespExpr::VecToArgList(resp_vec, &arg_vec);
+
+  string ft_create = "FT.CREATE";
+  arg_vec.insert(arg_vec.begin(), MutableSlice{ft_create.data(), ft_create.size()});
+
+  service_->DispatchCommand(absl::MakeSpan(arg_vec), &cntx);
+
+  auto response = crb.Take();
+  if (auto err = facade::CapturingReplyBuilder::GetError(response); err) {
+    LOG(ERROR) << "Bad index definition: " << def << " " << err->first;
+  }
 }
 
 }  // namespace dfly

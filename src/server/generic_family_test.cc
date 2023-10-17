@@ -474,11 +474,11 @@ TEST_F(GenericFamilyTest, Restore) {
                                  0x75, 0x59, 0x6d, 0x10, 0x04, 0x3f, 0x5c};
   auto resp = Run({"set", "exiting-key", "1234"});
   EXPECT_EQ(resp, "OK");
-  // try to restore into existing key - this should failed
+  // try to restore into existing key - this should fail
   ASSERT_THAT(Run({"restore", "exiting-key", "0", ToSV(STRING_DUMP_REDIS)}),
               ArgType(RespExpr::ERROR));
 
-  // Try restore while setting expiration into the pass
+  // Try restore while setting expiration into the past
   // note that value for expiration is just some valid unix time stamp from the pass
   resp = Run(
       {"restore", "exiting-key", "1665476212900", ToSV(STRING_DUMP_REDIS), "ABSTTL", "REPLACE"});
@@ -518,11 +518,11 @@ TEST_F(GenericFamilyTest, Restore) {
   resp = Run({"dump", "string-key"});
   dump = resp.GetBuf();
   // this will change the value from "hello world" to "1234"
-  resp = Run({"restore", "string-key", "7", ToSV(STRING_DUMP_REDIS), "REPLACE"});
+  resp = Run({"restore", "string-key", "7000", ToSV(STRING_DUMP_REDIS), "REPLACE"});
   resp = Run({"get", "string-key"});
   EXPECT_EQ("1234", resp);
   // check TTL validity
-  EXPECT_EQ(CheckedInt({"ttl", "string-key"}), 7);
+  EXPECT_EQ(CheckedInt({"pttl", "string-key"}), 7000);
 
   // Make check about ttl with abs time, restoring back to "hello world"
   resp = Run({"restore", "string-key", absl::StrCat(TEST_current_time_ms + 2000), ToSV(dump),
@@ -600,6 +600,23 @@ TEST_F(GenericFamilyTest, Info) {
   resp = Run({"del", "k3"});
   resp = Run({"info", "persistence"});
   EXPECT_EQ(1, get_rdb_changes_since_last_save(resp.GetString()));
+}
+
+TEST_F(GenericFamilyTest, FieldTtl) {
+  TEST_current_time_ms = kMemberExpiryBase * 1000;  // to reset to test time.
+  EXPECT_THAT(Run({"saddex", "key", "1", "val1"}), IntArg(1));
+  EXPECT_THAT(Run({"saddex", "key", "2", "val2"}), IntArg(1));
+  EXPECT_EQ(-2, CheckedInt({"fieldttl", "nokey", "val1"}));  // key not found
+  EXPECT_EQ(-3, CheckedInt({"fieldttl", "key", "bar"}));     // field not found
+  EXPECT_EQ(1, CheckedInt({"fieldttl", "key", "val1"}));
+  EXPECT_EQ(2, CheckedInt({"fieldttl", "key", "val2"}));
+
+  AdvanceTime(1100);
+  EXPECT_EQ(-3, CheckedInt({"fieldttl", "key", "val1"}));
+  EXPECT_EQ(1, CheckedInt({"fieldttl", "key", "val2"}));
+
+  Run({"set", "str", "val"});
+  EXPECT_THAT(Run({"fieldttl", "str", "bar"}), ErrArg("wrong"));
 }
 
 }  // namespace dfly

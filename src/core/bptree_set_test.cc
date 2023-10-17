@@ -22,35 +22,14 @@ using namespace std;
 
 namespace dfly {
 
-class BPTreeSetTest : public ::testing::Test {
-  using Node = detail::BPTreeNode<uint64_t>;
+namespace {
 
- protected:
-  static constexpr size_t kNumElems = 7000;
+template <typename Node, typename Policy>
+bool ValidateNode(const Node* node, typename Node::KeyT ubound) {
+  typename Policy::KeyCompareTo cmp;
 
-  BPTreeSetTest() : mi_alloc_(mi_heap_get_backing()), bptree_(&mi_alloc_) {
-  }
-  static void SetUpTestSuite() {
-  }
-
-  void FillTree(unsigned factor = 1) {
-    for (unsigned i = 0; i < kNumElems; ++i) {
-      bptree_.Insert(i * factor);
-    }
-  }
-
-  bool Validate();
-
-  static bool Validate(const Node* node, uint64_t ubound);
-
-  MiMemoryResource mi_alloc_;
-  BPTree<uint64_t> bptree_;
-  mt19937 generator_{1};
-};
-
-bool BPTreeSetTest::Validate(const Node* node, uint64_t ubound) {
   for (unsigned i = 1; i < node->NumItems(); ++i) {
-    if (node->Key(i - 1) >= node->Key(i))
+    if (cmp(node->Key(i - 1), node->Key(i)) > -1)
       return false;
   }
 
@@ -71,8 +50,55 @@ bool BPTreeSetTest::Validate(const Node* node, uint64_t ubound) {
     }
   }
 
-  return node->Key(node->NumItems() - 1) < ubound;
+  return cmp(node->Key(node->NumItems() - 1), ubound) == -1;
 }
+
+struct ZsetPolicy {
+  struct KeyT {
+    double d;
+    sds s;
+  };
+
+  struct KeyCompareTo {
+    int operator()(const KeyT& left, const KeyT& right) {
+      if (left.d < right.d)
+        return -1;
+      if (left.d > right.d)
+        return 1;
+
+      // Note that sdscmp can return values outside of [-1, 1] range.
+      return sdscmp(left.s, right.s);
+    }
+  };
+};
+
+using SDSTree = BPTree<ZsetPolicy::KeyT, ZsetPolicy>;
+
+}  // namespace
+
+class BPTreeSetTest : public ::testing::Test {
+  using Node = detail::BPTreeNode<uint64_t>;
+
+ protected:
+  static constexpr size_t kNumElems = 7000;
+
+  BPTreeSetTest() : mi_alloc_(mi_heap_get_backing()), bptree_(&mi_alloc_) {
+  }
+  static void SetUpTestSuite() {
+  }
+
+  void FillTree(unsigned factor = 1) {
+    for (unsigned i = 0; i < kNumElems; ++i) {
+      bptree_.Insert(i * factor);
+    }
+  }
+
+  bool Validate();
+
+  MiMemoryResource mi_alloc_;
+  BPTree<uint64_t> bptree_;
+  mt19937 generator_{1};
+};
 
 bool BPTreeSetTest::Validate() {
   auto* root = bptree_.DEBUG_root();
@@ -80,16 +106,16 @@ bool BPTreeSetTest::Validate() {
     return true;
 
   // node, upper bound
-  std::vector<pair<Node*, uint64_t>> stack;
+  vector<pair<const Node*, uint64_t>> stack;
 
   stack.emplace_back(root, UINT64_MAX);
 
   while (!stack.empty()) {
-    Node* node = stack.back().first;
+    const Node* node = stack.back().first;
     uint64_t ubound = stack.back().second;
     stack.pop_back();
 
-    if (!Validate(node, ubound))
+    if (!ValidateNode<Node, BPTreePolicy<uint64_t>>(node, ubound))
       return false;
 
     if (!node->IsLeaf()) {
@@ -199,126 +225,80 @@ TEST_F(BPTreeSetTest, Iterate) {
   FillTree(2);
 
   unsigned cnt = 0;
-  bptree_.Iterate(31, 543, [&](uint64_t val) {
-    ASSERT_EQ((31 + cnt) * 2, val);
+  bool res = bptree_.Iterate(31, 543, [&](uint64_t val) {
+    if ((31 + cnt) * 2 != val)
+      return false;
     ++cnt;
+    return true;
   });
   ASSERT_EQ(543 - 31 + 1, cnt);
+  ASSERT_TRUE(res);
 
   for (unsigned j = 0; j < 10; ++j) {
     cnt = 0;
     unsigned from = generator_() % kNumElems;
     unsigned to = from + generator_() % (kNumElems - from);
-    bptree_.Iterate(from, to, [&](uint64_t val) {
-      ASSERT_EQ((from + cnt) * 2, val) << from << " " << to << " " << cnt;
+    res = bptree_.Iterate(from, to, [&](uint64_t val) {
+      if ((from + cnt) * 2 != val)
+        return false;
       ++cnt;
+      return true;
     });
+
     ASSERT_EQ(to - from + 1, cnt);
+    ASSERT_TRUE(res);
   }
 
   // Reverse iteration
   cnt = 0;
-  bptree_.IterateReverse(5845, 6849, [&](uint64_t val) {
-    ASSERT_EQ((6849 - cnt) * 2, val);
+  res = bptree_.IterateReverse(5845, 6849, [&](uint64_t val) {
+    if ((6849 - cnt) * 2 != val)
+      return false;
     ++cnt;
+    return true;
   });
   ASSERT_EQ(6849 - 5845 + 1, cnt);
+  ASSERT_TRUE(res);
 
   for (unsigned j = 0; j < 10; ++j) {
     cnt = 0;
     unsigned from = generator_() % kNumElems;
     unsigned to = from + generator_() % (kNumElems - from);
-    bptree_.IterateReverse(from, to, [&](uint64_t val) {
-      ASSERT_EQ((to - cnt) * 2, val) << from << " " << to << " " << cnt;
+    res = bptree_.IterateReverse(from, to, [&](uint64_t val) {
+      if ((to - cnt) * 2 != val)
+        return false;
       ++cnt;
+      return true;
     });
     ASSERT_EQ(to - from + 1, cnt);
+    ASSERT_TRUE(res);
   }
 }
 
-TEST_F(BPTreeSetTest, LowerBound) {
+TEST_F(BPTreeSetTest, Ranges) {
   FillTree(2);
 
-  auto path = bptree_.LowerBound(31);
+  auto path = bptree_.GEQ(31);
   EXPECT_EQ(32, path.Terminal());
 
-  path = bptree_.LowerBound(32);
+  path = bptree_.GEQ(32);
   EXPECT_EQ(32, path.Terminal());
 
-  path = bptree_.LowerBound(13998);
+  path = bptree_.GEQ(13998);
   EXPECT_EQ(13998, path.Terminal());
 
-  path = bptree_.LowerBound(14000);
+  path = bptree_.LEQ(14000);
+  EXPECT_EQ(13998, path.Terminal());
+
+  path = bptree_.GEQ(14000);
   EXPECT_EQ(0, path.Depth());
 
   ASSERT_TRUE(bptree_.Delete(0));
-  path = bptree_.LowerBound(0);
+  path = bptree_.GEQ(0);
   EXPECT_EQ(2, path.Terminal());
-}
 
-TEST_F(BPTreeSetTest, DeleteRangeRank) {
-  FillTree(2);
-
-  unsigned cnt = 0;
-  unsigned from = 5950;  //
-  unsigned to = 6513;
-  bptree_.DeleteRangeByRank(from, to, [&](uint64_t val) {
-    ASSERT_TRUE(Validate()) << val;
-    ASSERT_EQ((from + cnt) * 2, val) << from << " " << to << " " << cnt;
-    ++cnt;
-  });
-  ASSERT_EQ(to - from + 1, cnt);
-
-  return;
-
-  for (unsigned j = 0; j < 10; ++j) {
-    if (bptree_.Size() == 0)
-      break;
-
-    cnt = 0;
-    from = generator_() % bptree_.Size();
-    to = from + generator_() % (bptree_.Size() - from);
-    bptree_.DeleteRangeByRank(from, to, [&](uint64_t val) {
-      ASSERT_EQ((from + cnt) * 2, val) << from << " " << to << " " << cnt;
-      ++cnt;
-    });
-    ASSERT_EQ(to - from + 1, cnt);
-  }
-}
-
-TEST_F(BPTreeSetTest, DeleteRange) {
-  FillTree(2);
-  unsigned cnt = 0;
-  EXPECT_EQ(0, bptree_.DeleteRange(
-                   14000, 14000, [&](uint64_t val) { ++cnt; }, true, true));
-  EXPECT_EQ(0, cnt);
-  EXPECT_EQ(0, bptree_.DeleteRange(
-                   13999, 14000, [&](uint64_t val) { ++cnt; }, true, true));
-  EXPECT_EQ(0, cnt);
-  EXPECT_EQ(0, bptree_.DeleteRange(
-                   13998, 14000, [&](uint64_t val) { ++cnt; }, false, true));
-
-  EXPECT_EQ(1, bptree_.DeleteRange(
-                   13998, 13999, [&](uint64_t val) { ++cnt; }, true, true));
-  EXPECT_EQ(1, cnt);
-
-  EXPECT_EQ(2, bptree_.DeleteRange(
-                   13993, 13997, [&](uint64_t val) { ++cnt; }, true, true));
-  EXPECT_EQ(3, cnt);
-  ASSERT_TRUE(Validate());
-
-  constexpr unsigned kMaxElem = kNumElems * 2;
-  for (unsigned j = 0; j < 10; ++j) {
-    unsigned from = generator_() % kMaxElem;
-    unsigned to = from + generator_() % (kMaxElem - from);
-    bptree_.DeleteRange(
-        from, to,
-        [&](uint64_t val) {
-          ASSERT_LT(val, to);
-          ASSERT_GT(val, from);
-        },
-        false, false);
-  }
+  path = bptree_.LEQ(1);
+  EXPECT_TRUE(path.Empty());
 }
 
 TEST_F(BPTreeSetTest, MemoryUsage) {
@@ -353,25 +333,24 @@ TEST_F(BPTreeSetTest, MemoryUsage) {
   LOG(INFO) << "btree after: " << mi_alloc.used() << " bytes";
 }
 
-struct ZsetPolicy {
-  struct KeyT {
-    double d;
-    sds s;
-  };
+TEST_F(BPTreeSetTest, InsertSDS) {
+  vector<ZsetPolicy::KeyT> vals;
+  for (unsigned i = 0; i < 256; ++i) {
+    sds s = sdsempty();
 
-  struct KeyCompareTo {
-    int operator()(const KeyT& left, const KeyT& right) {
-      if (left.d < right.d)
-        return -1;
-      if (left.d > right.d)
-        return 1;
+    s = sdscatfmt(s, "a%u", i);
+    vals.emplace_back(ZsetPolicy::KeyT{.d = 1000, .s = s});
+  }
 
-      return sdscmp(left.s, right.s);
-    }
-  };
-};
+  SDSTree tree(&mi_alloc_);
+  for (size_t i = 0; i < vals.size(); ++i) {
+    ASSERT_TRUE(tree.Insert(vals[i]));
+  }
 
-using SDSTree = BPTree<ZsetPolicy::KeyT, ZsetPolicy>;
+  for (auto v : vals) {
+    sdsfree(v.s);
+  }
+}
 
 static string RandomString(mt19937& rand, unsigned len) {
   const string_view alpanum = "1234567890abcdefghijklmnopqrstuvwxyz";

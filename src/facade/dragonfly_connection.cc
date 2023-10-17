@@ -8,39 +8,58 @@
 #include <absl/strings/match.h>
 #include <mimalloc.h>
 
+#include <variant>
+
+#include "absl/strings/str_cat.h"
 #include "base/flags.h"
 #include "base/logging.h"
 #include "facade/conn_context.h"
+#include "facade/dragonfly_listener.h"
 #include "facade/memcache_parser.h"
 #include "facade/redis_parser.h"
 #include "facade/service_interface.h"
+#include "server/conn_context.h"
 #include "util/fibers/proactor_base.h"
 
 #ifdef DFLY_USE_SSL
 #include "util/tls/tls_socket.h"
 #endif
 
-ABSL_FLAG(bool, tcp_nodelay, false,
+using namespace std;
+
+ABSL_FLAG(bool, tcp_nodelay, true,
           "Configures dragonfly connections with socket option TCP_NODELAY");
 ABSL_FLAG(bool, primary_port_http_enabled, true,
           "If true allows accessing http console on main TCP port");
 
-ABSL_FLAG(
-    std::uint16_t, admin_port, 0,
-    "If set, would enable admin access to console on the assigned port. This supports both HTTP "
-    "and RESP protocols");
-ABSL_FLAG(std::string, admin_bind, "",
-          "If set, the admin consol TCP connection would be bind the given address. "
-          "This supports both HTTP and RESP "
-          "protocols");
+ABSL_FLAG(uint16_t, admin_port, 0,
+          "If set, would enable admin access to console on the assigned port. "
+          "This supports both HTTP and RESP protocols");
 
-ABSL_FLAG(std::uint64_t, request_cache_limit, 1ULL << 26,  // 64MB
+ABSL_FLAG(string, admin_bind, "",
+          "If set, the admin consol TCP connection would be bind the given address. "
+          "This supports both HTTP and RESP protocols");
+
+ABSL_FLAG(uint64_t, request_cache_limit, 1ULL << 26,  // 64MB
           "Amount of memory to use for request cache in bytes - per IO thread.");
+
+ABSL_FLAG(uint64_t, pipeline_queue_limit, 1ULL << 27,  // 128MB
+          "Amount of memory to use for storing pipelined commands in bytes - per IO thread");
 
 ABSL_FLAG(bool, no_tls_on_admin_port, false, "Allow non-tls connections on admin port");
 
+ABSL_FLAG(uint64_t, pipeline_squash, 5,
+          "Number of queued pipelined commands above which squashing is enabled, 0 means disabled");
+
+// When changing this constant, also update `test_large_cmd` test in connection_test.py.
+ABSL_FLAG(uint32_t, max_multi_bulk_len, 1u << 16,
+          "Maximum multi-bulk (array) length that is "
+          "allowed to be accepted when parsing RESP protocol");
+
+ABSL_FLAG(size_t, max_client_iobuf_len, 1u << 16,
+          "Maximum io buffer length that is used to read client requests.");
+
 using namespace util;
-using namespace std;
 using nonstd::make_unexpected;
 
 namespace facade {
@@ -75,15 +94,17 @@ bool MatchHttp11Line(string_view line) {
 }
 
 constexpr size_t kMinReadSize = 256;
-constexpr size_t kMaxReadSize = 32_KB;
-
-constexpr size_t kMaxDispatchQMemory = 5_MB;
 
 thread_local uint32_t free_req_release_weight = 0;
 
 }  // namespace
 
 thread_local vector<Connection::PipelineMessagePtr> Connection::pipeline_req_pool_;
+thread_local Connection::QueueBackpressure Connection::tl_queue_backpressure_;
+
+void Connection::QueueBackpressure::EnsureBelowLimit() {
+  ec.await([this] { return bytes.load(memory_order_relaxed) <= limit; });
+}
 
 struct Connection::Shutdown {
   absl::flat_hash_map<ShutdownHandle, ShutdownCb> map;
@@ -120,6 +141,7 @@ struct Connection::DispatchOperations {
   void operator()(const PubMessage& msg);
   void operator()(Connection::PipelineMessage& msg);
   void operator()(const MonitorMessage& msg);
+  void operator()(const AclUpdateMessage& msg);
 
   template <typename T, typename D> void operator()(unique_ptr<T, D>& ptr) {
     operator()(*ptr.get());
@@ -137,8 +159,9 @@ void Connection::PipelineMessage::SetArgs(const RespVec& args) {
     size_t s = buf.size();
     if (s)
       memcpy(next, buf.data(), s);
+    next[s] = '\0';
     this->args[i] = MutableSlice(next, s);
-    next += s;
+    next += (s + 1);
   }
 }
 
@@ -181,7 +204,11 @@ size_t Connection::MessageHandle::UsedMemory() const {
            arg.storage.capacity();
   };
   auto monitor_size = [](const MonitorMessage& arg) -> size_t { return arg.capacity(); };
-  return sizeof(MessageHandle) + visit(Overloaded{pub_size, msg_size, monitor_size}, this->handle);
+  auto acl_update_size = [](const AclUpdateMessage& msg) -> size_t {
+    return sizeof(AclUpdateMessage);
+  };
+  return sizeof(MessageHandle) +
+         visit(Overloaded{pub_size, msg_size, monitor_size, acl_update_size}, this->handle);
 }
 
 bool Connection::MessageHandle::IsPipelineMsg() const {
@@ -193,9 +220,20 @@ void Connection::DispatchOperations::operator()(const MonitorMessage& msg) {
   rbuilder->SendSimpleString(msg);
 }
 
+void Connection::DispatchOperations::operator()(const AclUpdateMessage& msg) {
+  auto* ctx = static_cast<dfly::ConnectionContext*>(self->cntx());
+  if (ctx) {
+    for (size_t id = 0; id < msg.username.size(); ++id) {
+      if (msg.username[id] == ctx->authed_username) {
+        ctx->acl_categories = msg.categories[id];
+        ctx->acl_commands = msg.commands[id];
+      }
+    }
+  }
+}
+
 void Connection::DispatchOperations::operator()(const PubMessage& pub_msg) {
   RedisReplyBuilder* rbuilder = (RedisReplyBuilder*)builder;
-  ++stats->async_writes_cnt;
   unsigned i = 0;
   array<string_view, 4> arr;
   if (pub_msg.pattern.empty()) {
@@ -231,7 +269,7 @@ Connection::Connection(Protocol protocol, util::HttpListenerBase* http_listener,
 
   switch (protocol) {
     case Protocol::REDIS:
-      redis_parser_.reset(new RedisParser);
+      redis_parser_.reset(new RedisParser(absl::GetFlag(FLAGS_max_multi_bulk_len)));
       break;
     case Protocol::MEMCACHE:
       memcache_parser_.reset(new MemcacheParser);
@@ -241,6 +279,11 @@ Connection::Connection(Protocol protocol, util::HttpListenerBase* http_listener,
   creation_time_ = time(nullptr);
   last_interaction_ = creation_time_;
   id_ = next_id.fetch_add(1, memory_order_relaxed);
+
+  queue_backpressure_ = &tl_queue_backpressure_;
+  if (queue_backpressure_->limit == 0) {
+    queue_backpressure_->limit = absl::GetFlag(FLAGS_pipeline_queue_limit);
+  }
 }
 
 Connection::~Connection() {
@@ -304,7 +347,7 @@ void Connection::HandleRequests() {
 #ifdef DFLY_USE_SSL
   if (ctx_) {
     const bool no_tls_on_admin_port = absl::GetFlag(FLAGS_no_tls_on_admin_port);
-    if (!(IsAdmin() && no_tls_on_admin_port)) {
+    if (!(IsPrivileged() && no_tls_on_admin_port)) {
       unique_ptr<tls::TlsSocket> tls_sock = make_unique<tls::TlsSocket>(std::move(socket_));
       tls_sock->InitSSL(ctx_);
       FiberSocketBase::AcceptResult aresult = tls_sock->Accept();
@@ -364,8 +407,11 @@ std::string Connection::LocalBindAddress() const {
   return le.address().to_string();
 }
 
-string Connection::GetClientInfo(unsigned thread_id) const {
-  string res;
+std::pair<std::string, std::string> Connection::GetClientInfoBeforeAfterTid() const {
+  CHECK(service_ && socket_);
+  CHECK_LT(unsigned(phase_), NUM_PHASES);
+
+  string before;
   auto le = socket_->LocalEndpoint();
   auto re = socket_->RemoteEndpoint();
   time_t now = time(nullptr);
@@ -373,41 +419,79 @@ string Connection::GetClientInfo(unsigned thread_id) const {
   int cpu = 0;
   socklen_t len = sizeof(cpu);
   getsockopt(socket_->native_handle(), SOL_SOCKET, SO_INCOMING_CPU, &cpu, &len);
-  int my_cpu_id = sched_getcpu();
 
-  static constexpr string_view PHASE_NAMES[] = {"readsock", "process"};
+#ifdef __APPLE__
+  int my_cpu_id = -1;  // __APPLE__ does not have sched_getcpu()
+#else
+  int my_cpu_id = sched_getcpu();
+#endif
+
+  static constexpr string_view PHASE_NAMES[] = {"setup", "readsock", "process"};
   static_assert(PHASE_NAMES[PROCESS] == "process");
 
-  absl::StrAppend(&res, "id=", id_, " addr=", re.address().to_string(), ":", re.port());
-  absl::StrAppend(&res, " laddr=", le.address().to_string(), ":", le.port());
-  absl::StrAppend(&res, " fd=", socket_->native_handle(), " name=", name_);
-  absl::StrAppend(&res, " tid=", thread_id, " irqmatch=", int(cpu == my_cpu_id));
-  absl::StrAppend(&res, " age=", now - creation_time_, " idle=", now - last_interaction_);
-  absl::StrAppend(&res, " phase=", PHASE_NAMES[phase_]);
+  absl::StrAppend(&before, "id=", id_, " addr=", re.address().to_string(), ":", re.port());
+  absl::StrAppend(&before, " laddr=", le.address().to_string(), ":", le.port());
+  absl::StrAppend(&before, " fd=", socket_->native_handle(), " name=", name_);
+
+  string after;
+  absl::StrAppend(&after, " irqmatch=", int(cpu == my_cpu_id));
+  absl::StrAppend(&after, " age=", now - creation_time_, " idle=", now - last_interaction_);
+  absl::StrAppend(&after, " phase=", PHASE_NAMES[phase_]);
 
   if (cc_) {
     string cc_info = service_->GetContextInfo(cc_.get());
-    if (!cc_info.empty()) {
-      absl::StrAppend(&res, " ", cc_info);
-    }
+    absl::StrAppend(&after, " ", cc_info);
   }
 
-  return res;
+  return {std::move(before), std::move(after)};
+}
+
+string Connection::GetClientInfo(unsigned thread_id) const {
+  auto [before, after] = GetClientInfoBeforeAfterTid();
+  absl::StrAppend(&before, " tid=", thread_id);
+  absl::StrAppend(&before, after);
+  return before;
+}
+
+string Connection::GetClientInfo() const {
+  auto [before, after] = GetClientInfoBeforeAfterTid();
+  absl::StrAppend(&before, after);
+  // The following are dummy fields and users should not rely on those unless
+  // we decide to implement them.
+  // This is only done because the redis pyclient parser for the field "client-info"
+  // for the command ACL LOG hardcodes the expected values. This behaviour does not
+  // conform to the actual expected values, since it's missing half of them.
+  // That is, even for redis-server, issuing an ACL LOG command via redis-cli and the pyclient
+  // will return different results! For example, the fields:
+  // addr=127.0.0.1:57275
+  // laddr=127.0.0.1:6379
+  // are missing from the pyclient.
+
+  absl::StrAppend(&before, " qbuf=0 ", "qbuf-free=0 ", "obl=0 ", "argv-mem=0 ");
+  absl::StrAppend(&before, "oll=0 ", "omem=0 ", "tot-mem=0 ", "multi=0 ");
+  absl::StrAppend(&before, "psub=0 ", "sub=0");
+  return before;
 }
 
 uint32_t Connection::GetClientId() const {
   return id_;
 }
 
-bool Connection::IsAdmin() const {
-  uint16_t admin_port = absl::GetFlag(FLAGS_admin_port);
-  return socket_->LocalEndpoint().port() == admin_port;
+bool Connection::IsPrivileged() const {
+  return static_cast<Listener*>(owner())->IsPrivilegedInterface();
+}
+
+bool Connection::IsMain() const {
+  return static_cast<Listener*>(owner())->IsMainInterface();
 }
 
 io::Result<bool> Connection::CheckForHttpProto(FiberSocketBase* peer) {
-  bool primary_port_enabled = absl::GetFlag(FLAGS_primary_port_http_enabled);
-  bool admin = IsAdmin();
-  if (!primary_port_enabled && !admin) {
+  if (!IsPrivileged() && !IsMain()) {
+    return false;
+  }
+
+  const bool primary_port_enabled = absl::GetFlag(FLAGS_primary_port_http_enabled);
+  if (!primary_port_enabled && !IsPrivileged()) {
     return false;
   }
 
@@ -464,6 +548,9 @@ void Connection::ConnectionFlow(FiberSocketBase* peer) {
 
   // Main loop.
   if (parse_status != ERROR && !ec) {
+    if (io_buf_.AppendLen() < 64) {
+      io_buf_.EnsureCapacity(io_buf_.Capacity() * 2);
+    }
     auto res = IoLoop(peer, orig_builder);
 
     if (holds_alternative<error_code>(res)) {
@@ -547,7 +634,7 @@ void Connection::DispatchCommand(uint32_t consumed, mi_heap_t* heap) {
   if (can_dispatch_sync) {
     ShrinkPipelinePool();  // Gradually release pipeline request pool.
 
-    RespToArgList(tmp_parse_args_, &tmp_cmd_vec_);
+    RespExpr::VecToArgList(tmp_parse_args_, &tmp_cmd_vec_);
 
     {
       cc_->sync_dispatch = true;
@@ -562,6 +649,7 @@ void Connection::DispatchCommand(uint32_t consumed, mi_heap_t* heap) {
       evc_.notify();
 
   } else {
+    dispatch_q_cmds_count_++;
     SendAsync(MessageHandle{FromArgs(move(tmp_parse_args_), heap)});
     if (dispatch_q_.size() > 10)
       ThisFiber::Yield();
@@ -642,8 +730,8 @@ auto Connection::ParseMemcache() -> ParserStatus {
     return NEED_MORE;
   }
 
-  if (result == MemcacheParser::PARSE_ERROR) {
-    builder->SendError("");  // ERROR.
+  if (result == MemcacheParser::PARSE_ERROR || result == MemcacheParser::UNKNOWN_CMD) {
+    builder->SendSimpleString("ERROR");
   } else if (result == MemcacheParser::BAD_DELTA) {
     builder->SendClientError("invalid numeric delta argument");
   } else if (result != MemcacheParser::OK) {
@@ -658,7 +746,12 @@ void Connection::OnBreakCb(int32_t mask) {
     return;  // we cancelled the poller, which means we do not need to break from anything.
 
   VLOG(1) << "Got event " << mask;
-  CHECK(cc_);
+
+  if (!cc_) {
+    LOG(ERROR) << "Unexpected event " << mask << " " << break_poll_id_;
+    return;
+  }
+
   cc_->conn_closing = true;
   break_poll_id_ = UINT32_MAX;  // do not attempt to cancel it.
 
@@ -671,10 +764,14 @@ auto Connection::IoLoop(util::FiberSocketBase* peer, SinkReplyBuilder* orig_buil
   error_code ec;
   ParserStatus parse_status = OK;
 
+  size_t max_iobfuf_len = absl::GetFlag(FLAGS_max_client_iobuf_len);
+
   do {
     FetchBuilderStats(stats_, orig_builder);
 
     io::MutableBytes append_buf = io_buf_.AppendBuffer();
+    DCHECK(!append_buf.empty());
+
     phase_ = READ_SOCKET;
 
     ::io::Result<size_t> recv_sz = peer->Recv(append_buf);
@@ -690,6 +787,7 @@ auto Connection::IoLoop(util::FiberSocketBase* peer, SinkReplyBuilder* orig_buil
     stats_->io_read_bytes += *recv_sz;
     ++stats_->io_read_cnt;
     phase_ = PROCESS;
+    bool is_iobuf_full = io_buf_.AppendLen() == 0;
 
     if (redis_parser_) {
       parse_status = ParseRedis(orig_builder);
@@ -702,14 +800,25 @@ auto Connection::IoLoop(util::FiberSocketBase* peer, SinkReplyBuilder* orig_buil
       parse_status = OK;
 
       size_t capacity = io_buf_.Capacity();
-      if (capacity < kMaxReadSize) {
+      if (capacity < max_iobfuf_len) {
         size_t parser_hint = 0;
         if (redis_parser_)
           parser_hint = redis_parser_->parselen_hint();  // Could be done for MC as well.
 
+        // If we got a partial request and we managed to parse its
+        // length, make sure we have space to store it instead of
+        // increasing space incrementally.
+        // (Note: The buffer object is only working in power-of-2 sizes,
+        // so there's no danger of accidental O(n^2) behavior.)
         if (parser_hint > capacity) {
-          io_buf_.Reserve(std::min(kMaxReadSize, parser_hint));
-        } else if (append_buf.size() == *recv_sz && append_buf.size() > capacity / 2) {
+          io_buf_.Reserve(std::min(max_iobfuf_len, parser_hint));
+        }
+
+        // If we got a partial request and we couldn't parse the length, just
+        // double the capacity.
+        // If we got a partial request because iobuf was full, grow it up to
+        // a reasonable limit to save on Recv() calls.
+        if (io_buf_.AppendLen() < 64u || (is_iobuf_full && capacity < 4096)) {
           // Last io used most of the io_buf to the end.
           io_buf_.Reserve(capacity * 2);  // Valid growth range.
         }
@@ -718,6 +827,13 @@ auto Connection::IoLoop(util::FiberSocketBase* peer, SinkReplyBuilder* orig_buil
           VLOG(1) << "Growing io_buf to " << io_buf_.Capacity();
           stats_->read_buf_capacity += (io_buf_.Capacity() - capacity);
         }
+        DCHECK_GT(io_buf_.AppendLen(), 0U);
+      } else if (io_buf_.AppendLen() == 0) {
+        // We have a full buffer and we can not progress with parsing.
+        // This means that we have request too large.
+        LOG(ERROR) << "Request is too large, closing connection";
+        parse_status = ERROR;
+        break;
       }
     } else if (parse_status != OK) {
       break;
@@ -743,35 +859,94 @@ void Connection::DispatchFiber(util::FiberSocketBase* peer) {
 
   SinkReplyBuilder* builder = cc_->reply_builder();
   DispatchOperations dispatch_op{builder, this};
-  uint64_t request_cache_limit = absl::GetFlag(FLAGS_request_cache_limit);
 
+  uint64_t request_cache_limit = absl::GetFlag(FLAGS_request_cache_limit);
+  size_t squashing_threshold = absl::GetFlag(FLAGS_pipeline_squash);
+
+  uint64_t prev_epoch = fb2::FiberSwitchEpoch();
   while (!builder->GetError()) {
     evc_.await(
         [this] { return cc_->conn_closing || (!dispatch_q_.empty() && !cc_->sync_dispatch); });
     if (cc_->conn_closing)
       break;
 
-    MessageHandle msg = move(dispatch_q_.front());
-    dispatch_q_.pop_front();
+    // We really want to have batching in the builder if possible. This is especially
+    // critical in situations where Nagle's algorithm can introduce unwanted high
+    // latencies. However we can only batch if we're sure that there are more commands
+    // on the way that will trigger a flush. To know if there are, we sometimes yield before
+    // executing the last command in the queue and let the producer fiber push more commands if it
+    // wants to.
+    // As an optimization, we only yield if the fiber was not suspended since the last dispatch.
+    uint64_t cur_epoch = fb2::FiberSwitchEpoch();
+    if (dispatch_q_.size() == 1 && cur_epoch == prev_epoch) {
+      ThisFiber::Yield();
+      DVLOG(1) << "After yielding to producer, dispatch_q_.size()=" << dispatch_q_.size();
+    }
+    prev_epoch = cur_epoch;
+    builder->SetBatchMode(dispatch_q_.size() > 1);
 
-    builder->SetBatchMode(dispatch_q_.size() > 0);
+    auto recycle = [this, request_cache_limit](MessageHandle msg) {
+      size_t used_mem = msg.UsedMemory();
+      queue_backpressure_->bytes.fetch_sub(used_mem, memory_order_relaxed);
 
-    {
+      stats_->dispatch_queue_bytes -= used_mem;
+      stats_->dispatch_queue_entries--;
+
+      // Retain pipeline message in pool.
+      if (auto* pipe = get_if<PipelineMessagePtr>(&msg.handle); pipe) {
+        dispatch_q_cmds_count_--;
+        if (stats_->pipeline_cmd_cache_bytes < request_cache_limit) {
+          stats_->pipeline_cmd_cache_bytes += (*pipe)->StorageCapacity();
+          pipeline_req_pool_.push_back(move(*pipe));
+        }
+      }
+    };
+
+    // Special case: if the dispatch queue accumulated a big number of commands,
+    // we can try to squash them
+    // It is only enabled if the threshold is reached and the whole dispatch queue
+    // consists only of commands (no pubsub or monitor messages)
+    bool squashing_enabled = squashing_threshold > 0;
+    bool threshold_reached = dispatch_q_cmds_count_ > squashing_threshold;
+    bool are_all_plain_cmds = dispatch_q_cmds_count_ == dispatch_q_.size();
+    if (squashing_enabled && threshold_reached && are_all_plain_cmds) {
+      vector<CmdArgList> args;
+      args.reserve(dispatch_q_.size());
+      for (auto& msg : dispatch_q_) {
+        CHECK(holds_alternative<PipelineMessagePtr>(msg.handle));
+        auto& pipe_msg = get<PipelineMessagePtr>(msg.handle);
+        args.push_back(absl::MakeSpan(pipe_msg->args));
+      }
+
+      cc_->async_dispatch = true;
+      service_->DispatchManyCommands(absl::MakeSpan(args), cc_.get());
+      cc_->async_dispatch = false;
+
+      // Flush strictly before the dispatch queue is cleared so that no sync dispatch can occur
+      if (dispatch_q_.size() == args.size()) {  // Flush if no new messages appeared
+        builder->FlushBatch();
+        builder->SetBatchMode(false);  // in case the next dispatch is sync
+      }
+
+      DCHECK(!cc_->sync_dispatch);
+      // Dispatch queue could have grown, so handle strictly as many as we executed
+      for (size_t i = 0; i < args.size(); i++) {
+        recycle(move(dispatch_q_.front()));
+        dispatch_q_.pop_front();
+      }
+
+    } else {
+      MessageHandle msg = move(dispatch_q_.front());
+      dispatch_q_.pop_front();
+
       cc_->async_dispatch = true;
       std::visit(dispatch_op, msg.handle);
       cc_->async_dispatch = false;
+
+      recycle(move(msg));
     }
 
-    dispatch_q_bytes_.fetch_sub(msg.UsedMemory(), memory_order_relaxed);
-    evc_bp_.notify();
-
-    // Retain pipeline message in pool.
-    if (auto* pipe = get_if<PipelineMessagePtr>(&msg.handle); pipe) {
-      if (stats_->pipeline_cache_capacity < request_cache_limit) {
-        stats_->pipeline_cache_capacity += (*pipe)->StorageCapacity();
-        pipeline_req_pool_.push_back(move(*pipe));
-      }
-    }
+    queue_backpressure_->ec.notify();
   }
 
   cc_->conn_closing = true;
@@ -785,7 +960,7 @@ Connection::PipelineMessagePtr Connection::FromArgs(RespVec args, mi_heap_t* hea
   size_t backed_sz = 0;
   for (const auto& arg : args) {
     CHECK_EQ(RespExpr::STRING, arg.type);
-    backed_sz += arg.GetBuf().size();
+    backed_sz += arg.GetBuf().size() + 1;  // for '\0'
   }
   DCHECK(backed_sz);
 
@@ -818,7 +993,7 @@ void Connection::ShrinkPipelinePool() {
 
   if (free_req_release_weight > stats_->num_conns) {
     free_req_release_weight = 0;
-    stats_->pipeline_cache_capacity -= pipeline_req_pool_.back()->StorageCapacity();
+    stats_->pipeline_cmd_cache_bytes -= pipeline_req_pool_.back()->StorageCapacity();
     pipeline_req_pool_.pop_back();
   }
 }
@@ -829,7 +1004,7 @@ Connection::PipelineMessagePtr Connection::GetFromPipelinePool() {
 
   free_req_release_weight = 0;  // Reset the release weight.
   auto ptr = move(pipeline_req_pool_.back());
-  stats_->pipeline_cache_capacity -= ptr->StorageCapacity();
+  stats_->pipeline_cmd_cache_bytes -= ptr->StorageCapacity();
   pipeline_req_pool_.pop_back();
   return ptr;
 }
@@ -858,15 +1033,6 @@ bool Connection::IsCurrentlyDispatching() const {
   return cc_->async_dispatch || cc_->sync_dispatch;
 }
 
-void RespToArgList(const RespVec& src, CmdArgVec* dest) {
-  dest->resize(src.size());
-  for (size_t i = 0; i < src.size(); ++i) {
-    DCHECK(src[i].type == RespExpr::STRING);
-
-    (*dest)[i] = ToMSS(src[i].GetBuf());
-  }
-}
-
 void Connection::SendPubMessageAsync(PubMessage msg) {
   void* ptr = mi_malloc(sizeof(PubMessage));
   SendAsync({PubMessagePtr{new (ptr) PubMessage{move(msg)}, MessageDeleter{}}});
@@ -874,6 +1040,10 @@ void Connection::SendPubMessageAsync(PubMessage msg) {
 
 void Connection::SendMonitorMessageAsync(string msg) {
   SendAsync({MonitorMessage{move(msg)}});
+}
+
+void Connection::SendAclUpdateAsync(AclUpdateMessage msg) {
+  SendAsync({std::move(msg)});
 }
 
 void Connection::SendAsync(MessageHandle msg) {
@@ -891,8 +1061,27 @@ void Connection::SendAsync(MessageHandle msg) {
         fb2::Fiber(dfly::Launch::post, "connection_dispatch", [&] { DispatchFiber(peer); });
   }
 
-  dispatch_q_bytes_.fetch_add(msg.UsedMemory(), memory_order_relaxed);
-  dispatch_q_.push_back(move(msg));
+  auto place_in_dispatch_q = [this](MessageHandle msg) {
+    auto it = dispatch_q_.begin();
+    const auto end = dispatch_q_.end();
+    while (it < end && std::holds_alternative<AclUpdateMessage>(it->handle))
+      ++it;
+    dispatch_q_.insert(it, std::move(msg));
+  };
+
+  size_t used_mem = msg.UsedMemory();
+  queue_backpressure_->bytes.fetch_add(used_mem, memory_order_relaxed);
+
+  stats_->dispatch_queue_entries++;
+  stats_->dispatch_queue_bytes += used_mem;
+
+  if (std::holds_alternative<AclUpdateMessage>(msg.handle)) {
+    // We need to reorder the queue, since multiple updates might happen before we
+    // pop the message, invalidating the correct order since we always push at the front
+    place_in_dispatch_q(std::move(msg));
+  } else {
+    dispatch_q_.push_back(std::move(msg));
+  }
 
   // Don't notify if a sync dispatch is in progress, it will wake after finishing.
   // This might only happen if we started receving messages while `SUBSCRIBE`
@@ -904,8 +1093,7 @@ void Connection::SendAsync(MessageHandle msg) {
 }
 
 void Connection::EnsureAsyncMemoryBudget() {
-  evc_bp_.await(
-      [this] { return dispatch_q_bytes_.load(memory_order_relaxed) <= kMaxDispatchQMemory; });
+  queue_backpressure_->EnsureBelowLimit();
 }
 
 std::string Connection::RemoteEndpointStr() const {
@@ -922,7 +1110,7 @@ std::string Connection::RemoteEndpointAddress() const {
   return re.address().to_string();
 }
 
-ConnectionContext* Connection::cntx() {
+facade::ConnectionContext* Connection::cntx() {
   return cc_.get();
 }
 

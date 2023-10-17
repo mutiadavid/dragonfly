@@ -13,6 +13,7 @@ extern "C" {
 #include "base/flags.h"
 #include "base/logging.h"
 #include "redis/rdb.h"
+#include "server/acl/acl_commands_def.h"
 #include "server/blocking_controller.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
@@ -23,6 +24,7 @@ extern "C" {
 #include "server/rdb_extensions.h"
 #include "server/rdb_load.h"
 #include "server/rdb_save.h"
+#include "server/set_family.h"
 #include "server/transaction.h"
 #include "util/varz.h"
 
@@ -39,12 +41,6 @@ namespace {
 using VersionBuffer = std::array<char, sizeof(uint16_t)>;
 using CrcBuffer = std::array<char, sizeof(uint64_t)>;
 constexpr size_t DUMP_FOOTER_SIZE = sizeof(uint64_t) + sizeof(uint16_t);  // version number and crc
-
-int64_t CalculateExpirationTime(bool seconds, bool absolute, int64_t ts, int64_t now_msec) {
-  int64_t msec = seconds ? ts * 1000 : ts;
-  int64_t rel_msec = absolute ? msec - now_msec : msec;
-  return rel_msec;
-}
 
 VersionBuffer MakeRdbVersion() {
   VersionBuffer buf;
@@ -113,7 +109,7 @@ class InMemSource : public ::io::Source {
 ::io::Result<size_t> InMemSource::ReadSome(const iovec* v, uint32_t len) {
   ssize_t read_total = 0;
   while (size_t(offs_) < buf_.size() && len > 0) {
-    size_t read_sz = min(buf_.size() - offs_, v->iov_len);
+    size_t read_sz = min<size_t>(buf_.size() - offs_, v->iov_len);
     memcpy(v->iov_base, buf_.data() + offs_, read_sz);
     read_total += read_sz;
     offs_ += read_sz;
@@ -187,12 +183,13 @@ class RestoreArgs {
     return replace_;
   }
 
-  constexpr int64_t ExpirationTime() const {
+  uint64_t ExpirationTime() const {
+    DCHECK_GE(expiration_, 0);
     return expiration_;
   }
 
   [[nodiscard]] constexpr bool Expired() const {
-    return ExpirationTime() < 0;
+    return expiration_ < 0;
   }
 
   [[nodiscard]] constexpr bool HasExpiration() const {
@@ -206,14 +203,11 @@ class RestoreArgs {
 
 [[nodiscard]] bool RestoreArgs::UpdateExpiration(int64_t now_msec) {
   if (HasExpiration()) {
-    auto new_ttl = CalculateExpirationTime(!abs_time_, abs_time_, expiration_, now_msec);
-    if (new_ttl > kMaxExpireDeadlineSec * 1000) {
+    int64_t ttl = abs_time_ ? expiration_ - now_msec : expiration_;
+    if (ttl > kMaxExpireDeadlineSec * 1000)
       return false;
-    }
-    expiration_ = new_ttl;
-    if (new_ttl > 0) {
-      expiration_ += now_msec;
-    }
+
+    expiration_ = ttl < 0 ? -1 : ttl + now_msec;
   }
   return true;
 }
@@ -625,6 +619,27 @@ OpStatus OpExpire(const OpArgs& op_args, string_view key, const DbSlice::ExpireP
   return res.status();
 }
 
+// returns -2 if the key was not found, -3 if the field was not found,
+// -1 if ttl on the field was not found.
+OpResult<long> OpFieldTtl(Transaction* t, EngineShard* shard, string_view key, string_view field) {
+  auto& db_slice = shard->db_slice();
+  const DbContext& db_cntx = t->GetDbContext();
+  auto [it, expire_it] = db_slice.FindExt(db_cntx, key);
+  if (!IsValid(it))
+    return -2;
+
+  if (it->second.ObjType() != OBJ_SET)  // TODO: to finish for hashes.
+    return OpStatus::WRONG_TYPE;
+
+  if (it->second.ObjType() == OBJ_SET) {
+    int32_t res = SetFamily::FieldExpireTime(db_cntx, it->second, field);
+    return res <= 0 ? res : int32_t(res - MemberTimeSeconds(db_cntx.time_now_ms));
+  }
+
+  // TODO: to finish with hash family.
+  return OpStatus::INVALID_VALUE;
+}
+
 }  // namespace
 
 void GenericFamily::Init(util::ProactorPool* pp) {
@@ -730,7 +745,7 @@ void GenericFamily::Expire(CmdArgList args, ConnectionContext* cntx) {
     return (*cntx)->SendError(InvalidExpireTime(cntx->cid->name()));
   }
 
-  int_arg = std::max(int_arg, -1L);
+  int_arg = std::max<int64_t>(int_arg, -1);
   DbSlice::ExpireParams params{.value = int_arg};
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
@@ -750,7 +765,7 @@ void GenericFamily::ExpireAt(CmdArgList args, ConnectionContext* cntx) {
     return (*cntx)->SendError(kInvalidIntErr);
   }
 
-  int_arg = std::max(int_arg, 0L);
+  int_arg = std::max<int64_t>(int_arg, 0L);
   DbSlice::ExpireParams params{.value = int_arg, .absolute = true};
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
@@ -794,7 +809,7 @@ void GenericFamily::PexpireAt(CmdArgList args, ConnectionContext* cntx) {
   if (!absl::SimpleAtoi(msec, &int_arg)) {
     return (*cntx)->SendError(kInvalidIntErr);
   }
-  int_arg = std::max(int_arg, 0L);
+  int_arg = std::max<int64_t>(int_arg, 0L);
   DbSlice::ExpireParams params{.value = int_arg, .absolute = true, .unit = TimeUnit::MSEC};
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
@@ -817,7 +832,7 @@ void GenericFamily::Pexpire(CmdArgList args, ConnectionContext* cntx) {
   if (!absl::SimpleAtoi(msec, &int_arg)) {
     return (*cntx)->SendError(kInvalidIntErr);
   }
-  int_arg = std::max(int_arg, 0L);
+  int_arg = std::max<int64_t>(int_arg, 0L);
   DbSlice::ExpireParams params{.value = int_arg, .unit = TimeUnit::MSEC};
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
@@ -1067,6 +1082,24 @@ void GenericFamily::Restore(CmdArgList args, ConnectionContext* cntx) {
   }
 }
 
+// Returns -2 if key not found, WRONG_TYPE if key is not a set or hash
+// -1 if the field does not have associated TTL on it, and -3 if field is not found.
+void GenericFamily::FieldTtl(CmdArgList args, ConnectionContext* cntx) {
+  string_view key = ArgS(args, 0);
+  string_view field = ArgS(args, 1);
+
+  auto cb = [&](Transaction* t, EngineShard* shard) { return OpFieldTtl(t, shard, key, field); };
+
+  OpResult<long> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+
+  if (result) {
+    (*cntx)->SendLong(*result);
+    return;
+  }
+
+  (*cntx)->SendError(result.status());
+}
+
 void GenericFamily::Move(CmdArgList args, ConnectionContext* cntx) {
   string_view key = ArgS(args, 0);
   string_view target_db_sv = ArgS(args, 1);
@@ -1189,7 +1222,6 @@ void GenericFamily::Dump(CmdArgList args, ConnectionContext* cntx) {
              << result.value().size();
     (*cntx)->SendBulkString(*result);
   } else {
-    DVLOG(1) << "Dump failed: " << result.DebugFormat() << key << " nil";
     (*cntx)->SendNull();
   }
 }
@@ -1445,39 +1477,75 @@ using CI = CommandId;
 
 #define HFUNC(x) SetHandler(&GenericFamily::x)
 
+namespace acl {
+constexpr uint32_t kDel = KEYSPACE | WRITE | SLOW;
+constexpr uint32_t kPing = FAST | CONNECTION;
+constexpr uint32_t kEcho = FAST | CONNECTION;
+constexpr uint32_t kExists = KEYSPACE | READ | FAST;
+constexpr uint32_t kTouch = KEYSPACE | READ | FAST;
+constexpr uint32_t kExpire = KEYSPACE | WRITE | FAST;
+constexpr uint32_t kExpireAt = KEYSPACE | WRITE | FAST;
+constexpr uint32_t kPersist = KEYSPACE | WRITE | FAST;
+constexpr uint32_t kKeys = KEYSPACE | READ | SLOW | DANGEROUS;
+constexpr uint32_t kPExpireAt = KEYSPACE | WRITE | FAST;
+constexpr uint32_t kPExpire = KEYSPACE | WRITE | FAST;
+constexpr uint32_t kRename = KEYSPACE | WRITE | SLOW;
+constexpr uint32_t kRenamNX = KEYSPACE | WRITE | FAST;
+constexpr uint32_t kSelect = FAST | CONNECTION;
+constexpr uint32_t kScan = KEYSPACE | READ | SLOW;
+constexpr uint32_t kTTL = KEYSPACE | READ | FAST;
+constexpr uint32_t kPTTL = KEYSPACE | READ | FAST;
+constexpr uint32_t kFieldTtl = KEYSPACE | READ | FAST;
+constexpr uint32_t kTime = FAST;
+constexpr uint32_t kType = KEYSPACE | READ | FAST;
+constexpr uint32_t kDump = KEYSPACE | READ | SLOW;
+constexpr uint32_t kUnlink = KEYSPACE | WRITE | FAST;
+// TODO investigate what stick is
+constexpr uint32_t kStick = SLOW;
+constexpr uint32_t kSort = WRITE | SET | SORTEDSET | LIST | SLOW | DANGEROUS;
+constexpr uint32_t kMove = KEYSPACE | WRITE | FAST;
+constexpr uint32_t kRestore = KEYSPACE | WRITE | SLOW | DANGEROUS;
+}  // namespace acl
+
 void GenericFamily::Register(CommandRegistry* registry) {
   constexpr auto kSelectOpts = CO::LOADING | CO::FAST | CO::NOSCRIPT;
-
-  *registry << CI{"DEL", CO::WRITE, -2, 1, -1, 1}.HFUNC(Del)
-            /* Redis compatibility:
-             * We don't allow PING during loading since in Redis PING is used as
-             * failure detection, and a loading server is considered to be
-             * not available. */
-            << CI{"PING", CO::FAST, -1, 0, 0, 0}.HFUNC(Ping)
-            << CI{"ECHO", CO::LOADING | CO::FAST, 2, 0, 0, 0}.HFUNC(Echo)
-            << CI{"EXISTS", CO::READONLY | CO::FAST, -2, 1, -1, 1}.HFUNC(Exists)
-            << CI{"TOUCH", CO::READONLY | CO::FAST, -2, 1, -1, 1}.HFUNC(Exists)
-            << CI{"EXPIRE", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, 1}.HFUNC(Expire)
-            << CI{"EXPIREAT", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, 1}.HFUNC(ExpireAt)
-            << CI{"PERSIST", CO::WRITE | CO::FAST, 2, 1, 1, 1}.HFUNC(Persist)
-            << CI{"KEYS", CO::READONLY, 2, 0, 0, 0}.HFUNC(Keys)
-            << CI{"PEXPIREAT", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, 1}.HFUNC(
-                   PexpireAt)
-            << CI{"PEXPIRE", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, 1}.HFUNC(Pexpire)
-            << CI{"RENAME", CO::WRITE | CO::NO_AUTOJOURNAL, 3, 1, 2, 1}.HFUNC(Rename)
-            << CI{"RENAMENX", CO::WRITE | CO::NO_AUTOJOURNAL, 3, 1, 2, 1}.HFUNC(RenameNx)
-            << CI{"SELECT", kSelectOpts, 2, 0, 0, 0}.HFUNC(Select)
-            << CI{"SCAN", CO::READONLY | CO::FAST | CO::LOADING, -2, 0, 0, 0}.HFUNC(Scan)
-            << CI{"TTL", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(Ttl)
-            << CI{"PTTL", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(Pttl)
-            << CI{"TIME", CO::LOADING | CO::FAST, 1, 0, 0, 0}.HFUNC(Time)
-            << CI{"TYPE", CO::READONLY | CO::FAST | CO::LOADING, 2, 1, 1, 1}.HFUNC(Type)
-            << CI{"DUMP", CO::READONLY, 2, 1, 1, 1}.HFUNC(Dump)
-            << CI{"UNLINK", CO::WRITE, -2, 1, -1, 1}.HFUNC(Del)
-            << CI{"STICK", CO::WRITE, -2, 1, -1, 1}.HFUNC(Stick)
-            << CI{"SORT", CO::READONLY, -2, 1, 1, 1}.HFUNC(Sort)
-            << CI{"MOVE", CO::WRITE | CO::GLOBAL_TRANS | CO::NO_AUTOJOURNAL, 3, 1, 1, 1}.HFUNC(Move)
-            << CI{"RESTORE", CO::WRITE, -4, 1, 1, 1}.HFUNC(Restore);
+  registry->StartFamily();
+  *registry
+      << CI{"DEL", CO::WRITE, -2, 1, -1, 1, acl::kDel}.HFUNC(Del)
+      /* Redis compatibility:
+       * We don't allow PING during loading since in Redis PING is used as
+       * failure detection, and a loading server is considered to be
+       * not available. */
+      << CI{"PING", CO::FAST, -1, 0, 0, 0, acl::kPing}.HFUNC(Ping)
+      << CI{"ECHO", CO::LOADING | CO::FAST, 2, 0, 0, 0, acl::kEcho}.HFUNC(Echo)
+      << CI{"EXISTS", CO::READONLY | CO::FAST, -2, 1, -1, 1, acl::kExists}.HFUNC(Exists)
+      << CI{"TOUCH", CO::READONLY | CO::FAST, -2, 1, -1, 1, acl::kTouch}.HFUNC(Exists)
+      << CI{"EXPIRE", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, 1, acl::kExpire}.HFUNC(
+             Expire)
+      << CI{"EXPIREAT", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, 1, acl::kExpireAt}
+             .HFUNC(ExpireAt)
+      << CI{"PERSIST", CO::WRITE | CO::FAST, 2, 1, 1, 1, acl::kPersist}.HFUNC(Persist)
+      << CI{"KEYS", CO::READONLY, 2, 0, 0, 0, acl::kKeys}.HFUNC(Keys)
+      << CI{"PEXPIREAT", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, 1, acl::kPExpireAt}
+             .HFUNC(PexpireAt)
+      << CI{"PEXPIRE", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, 1, acl::kPExpire}.HFUNC(
+             Pexpire)
+      << CI{"RENAME", CO::WRITE | CO::NO_AUTOJOURNAL, 3, 1, 2, 1, acl::kRename}.HFUNC(Rename)
+      << CI{"RENAMENX", CO::WRITE | CO::NO_AUTOJOURNAL, 3, 1, 2, 1, acl::kRenamNX}.HFUNC(RenameNx)
+      << CI{"SELECT", kSelectOpts, 2, 0, 0, 0, acl::kSelect}.HFUNC(Select)
+      << CI{"SCAN", CO::READONLY | CO::FAST | CO::LOADING, -2, 0, 0, 0, acl::kScan}.HFUNC(Scan)
+      << CI{"TTL", CO::READONLY | CO::FAST, 2, 1, 1, 1, acl::kTTL}.HFUNC(Ttl)
+      << CI{"PTTL", CO::READONLY | CO::FAST, 2, 1, 1, 1, acl::kPTTL}.HFUNC(Pttl)
+      << CI{"FIELDTTL", CO::READONLY | CO::FAST, 3, 1, 1, 1, acl::kFieldTtl}.HFUNC(FieldTtl)
+      << CI{"TIME", CO::LOADING | CO::FAST, 1, 0, 0, 0, acl::kTime}.HFUNC(Time)
+      << CI{"TYPE", CO::READONLY | CO::FAST | CO::LOADING, 2, 1, 1, 1, acl::kType}.HFUNC(Type)
+      << CI{"DUMP", CO::READONLY, 2, 1, 1, 1, acl::kDump}.HFUNC(Dump)
+      << CI{"UNLINK", CO::WRITE, -2, 1, -1, 1, acl::kUnlink}.HFUNC(Del)
+      << CI{"STICK", CO::WRITE, -2, 1, -1, 1, acl::kStick}.HFUNC(Stick)
+      << CI{"SORT", CO::READONLY, -2, 1, 1, 1, acl::kSort}.HFUNC(Sort)
+      << CI{"MOVE", CO::WRITE | CO::GLOBAL_TRANS | CO::NO_AUTOJOURNAL, 3, 1, 1, 1, acl::kMove}
+             .HFUNC(Move)
+      << CI{"RESTORE", CO::WRITE, -4, 1, 1, 1, acl::kRestore}.HFUNC(Restore);
 }
 
 }  // namespace dfly

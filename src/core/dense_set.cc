@@ -57,6 +57,7 @@ void DenseSet::IteratorBase::Advance() {
       ++curr_list_;
       if (curr_list_ == owner_->entries_.end()) {
         curr_entry_ = nullptr;
+        owner_ = nullptr;
         return;
       }
       owner_->ExpireIfNeeded(nullptr, &(*curr_list_));
@@ -229,11 +230,13 @@ auto DenseSet::FindEmptyAround(uint32_t bid) -> ChainVectorIterator {
 }
 
 void DenseSet::Reserve(size_t sz) {
-  sz = std::min<size_t>(sz, kMinSize);
+  sz = std::max<size_t>(sz, kMinSize);
 
   sz = absl::bit_ceil(sz);
-  capacity_log_ = absl::bit_width(sz);
-  entries_.reserve(sz);
+  if (sz > entries_.size()) {
+    entries_.resize(sz);
+    capacity_log_ = absl::bit_width(sz) - 1;
+  }
 }
 
 void DenseSet::Grow() {
@@ -335,6 +338,19 @@ auto DenseSet::AddOrFindDense(void* ptr, bool has_ttl) -> DensePtr* {
     return dptr;
   }
 
+  AddUnique(ptr, has_ttl, hc);
+  return nullptr;
+}
+
+// Assumes that the object does not exist in the set.
+void DenseSet::AddUnique(void* obj, bool has_ttl, uint64_t hashcode) {
+  if (entries_.empty()) {
+    capacity_log_ = kMinSizeShift;
+    entries_.resize(kMinSize);
+  }
+
+  uint32_t bucket_id = BucketId(hashcode);
+
   DCHECK_LT(bucket_id, entries_.size());
 
   // Try insert into flat surface first. Also handle the grow case
@@ -342,13 +358,13 @@ auto DenseSet::AddOrFindDense(void* ptr, bool has_ttl) -> DensePtr* {
   for (unsigned j = 0; j < 2; ++j) {
     ChainVectorIterator list = FindEmptyAround(bucket_id);
     if (list != entries_.end()) {
-      obj_malloc_used_ += PushFront(list, ptr, has_ttl);
+      obj_malloc_used_ += PushFront(list, obj, has_ttl);
       if (std::distance(entries_.begin(), list) != bucket_id) {
         list->SetDisplaced(std::distance(entries_.begin() + bucket_id, list));
       }
       ++num_used_buckets_;
       ++size_;
-      return nullptr;
+      return;
     }
 
     if (size_ < entries_.size()) {
@@ -356,7 +372,7 @@ auto DenseSet::AddOrFindDense(void* ptr, bool has_ttl) -> DensePtr* {
     }
 
     Grow();
-    bucket_id = BucketId(hc);
+    bucket_id = BucketId(hashcode);
   }
 
   DCHECK(!entries_[bucket_id].IsEmpty());
@@ -371,7 +387,7 @@ auto DenseSet::AddOrFindDense(void* ptr, bool has_ttl) -> DensePtr* {
    * unlink it and repeat the steps
    */
 
-  DensePtr to_insert(ptr);
+  DensePtr to_insert(obj);
   if (has_ttl)
     to_insert.SetTtl(true);
 
@@ -389,45 +405,55 @@ auto DenseSet::AddOrFindDense(void* ptr, bool has_ttl) -> DensePtr* {
 
   ChainVectorIterator list = entries_.begin() + bucket_id;
   PushFront(list, to_insert);
-  obj_malloc_used_ += ObjectAllocSize(ptr);
+  obj_malloc_used_ += ObjectAllocSize(obj);
   DCHECK(!entries_[bucket_id].IsDisplaced());
 
   ++size_;
-  return nullptr;
 }
 
-auto DenseSet::Find(const void* ptr, uint32_t bid, uint32_t cookie) -> pair<DensePtr*, DensePtr*> {
-  // could do it with zigzag decoding but this is clearer.
-  int offset[] = {0, -1, 1};
+auto DenseSet::Find2(const void* ptr, uint32_t bid, uint32_t cookie)
+    -> tuple<size_t, DensePtr*, DensePtr*> {
+  DensePtr* curr = &entries_[bid];
+  ExpireIfNeeded(nullptr, curr);
+
+  if (Equal(*curr, ptr, cookie)) {
+    return {bid, nullptr, curr};
+  }
 
   // first look for displaced nodes since this is quicker than iterating a potential long chain
-  for (int j = 0; j < 3; ++j) {
-    if ((bid == 0 && j == 1) || (bid + 1 == entries_.size() && j == 2))
-      continue;
-
-    DensePtr* curr = &entries_[bid + offset[j]];
-
+  if (bid > 0) {
+    curr = &entries_[bid - 1];
     ExpireIfNeeded(nullptr, curr);
+
     if (Equal(*curr, ptr, cookie)) {
-      return make_pair(nullptr, curr);
+      return {bid - 1, nullptr, curr};
+    }
+  }
+
+  if (bid + 1 < entries_.size()) {
+    curr = &entries_[bid + 1];
+    ExpireIfNeeded(nullptr, curr);
+
+    if (Equal(*curr, ptr, cookie)) {
+      return {bid + 1, nullptr, curr};
     }
   }
 
   // if the node is not displaced, search the correct chain
   DensePtr* prev = &entries_[bid];
-  DensePtr* curr = prev->Next();
+  curr = prev->Next();
   while (curr != nullptr) {
     ExpireIfNeeded(prev, curr);
 
     if (Equal(*curr, ptr, cookie)) {
-      return make_pair(prev, curr);
+      return {bid, prev, curr};
     }
     prev = curr;
     curr = curr->Next();
   }
 
   // not in the Set
-  return make_pair(nullptr, nullptr);
+  return {0, nullptr, nullptr};
 }
 
 void DenseSet::Delete(DensePtr* prev, DensePtr* ptr) {
@@ -610,20 +636,21 @@ auto DenseSet::NewLink(void* data, DensePtr next) -> DenseLinkKey* {
   return lk;
 }
 
-bool DenseSet::ExpireIfNeeded(DensePtr* prev, DensePtr* node) const {
+bool DenseSet::ExpireIfNeededInternal(DensePtr* prev, DensePtr* node) const {
   DCHECK(node != nullptr);
+  DCHECK(node->HasTtl());
 
   bool deleted = false;
-  while (node->HasTtl()) {
+  do {
     uint32_t obj_time = ObjExpireTime(node->GetObject());
     if (obj_time > time_now_) {
       break;
     }
 
-    // updates the node to next item if relevant.
+    // updates the *node to next item if relevant or resets it to empty.
     const_cast<DenseSet*>(this)->Delete(prev, node);
     deleted = true;
-  }
+  } while (node->HasTtl());
 
   return deleted;
 }

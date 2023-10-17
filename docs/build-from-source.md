@@ -2,7 +2,7 @@
 
 ## Running the server
 
-Dragonfly runs on linux. We advice running it on linux version 5.11 or later
+Dragonfly runs on linux. We advise running it on linux version 5.11 or later
 but you can also run Dragonfly on older kernels as well.
 
 > :warning: **Dragonfly releases are compiled with LTO (link time optimization)**:
@@ -22,7 +22,7 @@ sudo apt install ninja-build libunwind-dev libboost-fiber-dev libssl-dev \
 On Fedora:
 
 ```bash
-sudo yum install automake boost-devel g++ git cmake libtool ninja-build libzstd-devel  \
+sudo dnf install -y automake boost-devel g++ git cmake libtool ninja-build libzstd-devel  \
      openssl-devel libunwind-devel autoconf-archive patch bison libxml2-devel
 ```
 

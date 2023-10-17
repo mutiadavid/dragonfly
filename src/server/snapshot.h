@@ -61,6 +61,13 @@ class SliceSnapshot {
   // In journal streaming mode it needs to be stopped by either Stop or Cancel.
   void Start(bool stream_journal, const Cancellation* cll);
 
+  // Initialize a snapshot that sends only the missing journal updates
+  // since start_lsn and then registers a callback switches into the
+  // journal streaming mode until stopped.
+  // If we're slower than the buffer and can't continue, `Cancel()` is
+  // called.
+  void StartIncremental(Context* cntx, LSN start_lsn);
+
   // Stop snapshot. Only needs to be called for journal streaming mode.
   void Stop();
 
@@ -92,7 +99,7 @@ class SliceSnapshot {
   void OnDbChange(DbIndex db_index, const DbSlice::ChangeReq& req);
 
   // Journal listener
-  void OnJournalEntry(const journal::Entry& entry, bool unused_await_arg);
+  void OnJournalEntry(const journal::JournalItem& item, bool unused_await_arg);
 
   // Close dest channel if not closed yet.
   void CloseRecordChannel();
@@ -107,13 +114,15 @@ class SliceSnapshot {
     return snapshot_version_;
   }
 
-  size_t channel_bytes() const {
-    return stats_.channel_bytes;
+  size_t pushed_bytes() const {
+    return stats_.pushed_bytes;
   }
 
   const RdbTypeFreqMap& freq_map() const {
     return type_freq_map_;
   }
+
+  size_t GetTotalBufferCapacity() const;
 
  private:
   DbSlice* db_slice_;
@@ -139,7 +148,7 @@ class SliceSnapshot {
   uint64_t rec_id_ = 0;
 
   struct Stats {
-    size_t channel_bytes = 0;
+    size_t pushed_bytes = 0;
     size_t loop_serialized = 0, skipped = 0, side_saved = 0;
     size_t savecb_calls = 0;
   } stats_;

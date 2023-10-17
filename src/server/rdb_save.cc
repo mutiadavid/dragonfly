@@ -673,6 +673,7 @@ error_code RdbSerializer::SaveStreamConsumers(streamCG* cg) {
 }
 
 error_code RdbSerializer::SendJournalOffset(uint64_t journal_offset) {
+  VLOG(2) << "SendJournalOffset";
   RETURN_ON_ERR(WriteOpcode(RDB_OPCODE_JOURNAL_OFFSET));
   uint8_t buf[sizeof(uint64_t)];
   absl::little_endian::Store64(buf, journal_offset);
@@ -680,6 +681,7 @@ error_code RdbSerializer::SendJournalOffset(uint64_t journal_offset) {
 }
 
 error_code RdbSerializer::SendFullSyncCut() {
+  VLOG(2) << "SendFullSyncCut";
   RETURN_ON_ERR(WriteOpcode(RDB_OPCODE_FULLSYNC_END));
 
   // RDB_OPCODE_FULLSYNC_END followed by 8 bytes of 0.
@@ -688,6 +690,10 @@ error_code RdbSerializer::SendFullSyncCut() {
   // the last opcodes sent to replica, we respect this requirement by sending a blob of 8 bytes.
   uint8_t buf[8] = {0};
   return WriteRaw(buf);
+}
+
+size_t RdbSerializer::GetTotalBufferCapacity() const {
+  return mem_buf_.Capacity();
 }
 
 error_code RdbSerializer::WriteRaw(const io::Bytes& buf) {
@@ -733,15 +739,11 @@ io::Bytes RdbSerializer::PrepareFlush() {
   return mem_buf_.InputBuffer();
 }
 
-error_code RdbSerializer::WriteJournalEntry(const journal::Entry& entry) {
-  io::BufSink buf_sink{&journal_mem_buf_};
-  JournalWriter writer{&buf_sink};
-  writer.Write(entry);
-
+error_code RdbSerializer::WriteJournalEntry(std::string_view serialized_entry) {
+  VLOG(2) << "WriteJournalEntry";
   RETURN_ON_ERR(WriteOpcode(RDB_OPCODE_JOURNAL_BLOB));
   RETURN_ON_ERR(SaveLen(1));
-  RETURN_ON_ERR(SaveString(io::View(journal_mem_buf_.InputBuffer())));
-  journal_mem_buf_.Clear();
+  RETURN_ON_ERR(SaveString(serialized_entry));
   return error_code{};
 }
 
@@ -898,21 +900,23 @@ class RdbSaver::Impl {
        SaveMode save_mode, io::Sink* sink);
 
   void StartSnapshotting(bool stream_journal, const Cancellation* cll, EngineShard* shard);
+  void StartIncrementalSnapshotting(Context* cntx, EngineShard* shard, LSN start_lsn);
 
   void StopSnapshotting(EngineShard* shard);
 
   error_code ConsumeChannel(const Cancellation* cll);
 
-  error_code Flush() {
-    if (aligned_buf_)
-      return aligned_buf_->Flush();
-
-    return error_code{};
-  }
-
   void FillFreqMap(RdbTypeFreqMap* dest) const;
 
   error_code SaveAuxFieldStrStr(string_view key, string_view val);
+
+  void Cancel();
+
+  size_t GetTotalBuffersSize() const;
+
+  error_code Flush() {
+    return aligned_buf_ ? aligned_buf_->Flush() : error_code{};
+  }
 
   size_t Size() const {
     return shard_snapshots_.size();
@@ -921,11 +925,10 @@ class RdbSaver::Impl {
   RdbSerializer* serializer() {
     return &meta_serializer_;
   }
+
   io::Sink* sink() {
     return sink_;
   }
-
-  void Cancel();
 
  private:
   unique_ptr<SliceSnapshot>& GetSnapshot(EngineShard* shard);
@@ -937,20 +940,27 @@ class RdbSaver::Impl {
   SliceSnapshot::RecordChannel channel_;
   bool push_to_sink_with_order_ = false;
   std::optional<AlignedBuffer> aligned_buf_;
-  CompressionMode
-      compression_mode_;  // Single entry compression is compatible with redis rdb snapshot
-                          // Multi entry compression is available only on df snapshot, this will
-                          // make snapshot size smaller and opreation faster.
+
+  // Single entry compression is compatible with redis rdb snapshot
+  // Multi entry compression is available only on df snapshot, this will
+  // make snapshot size smaller and opreation faster.
+  CompressionMode compression_mode_;
+
+  struct Stats {
+    size_t pulled_bytes = 0;
+  } stats_;
 };
 
 // We pass K=sz to say how many producers are pushing data in order to maintain
 // correct closing semantics - channel is closing when K producers marked it as closed.
 RdbSaver::Impl::Impl(bool align_writes, unsigned producers_len, CompressionMode compression_mode,
                      SaveMode sm, io::Sink* sink)
-    : sink_(sink), shard_snapshots_(producers_len),
+    : sink_(sink),
+      shard_snapshots_(producers_len),
       meta_serializer_(CompressionMode::NONE),  // Note: I think there is not need for compression
                                                 // at all in meta serializer
-      channel_{128, producers_len}, compression_mode_(compression_mode) {
+      channel_{128, producers_len},
+      compression_mode_(compression_mode) {
   if (align_writes) {
     aligned_buf_.emplace(kBufLen, sink);
     sink_ = &aligned_buf_.value();
@@ -1013,16 +1023,13 @@ std::optional<SliceSnapshot::DbRecord> RdbSaver::Impl::RecordsPopper::InternalPo
 
 error_code RdbSaver::Impl::ConsumeChannel(const Cancellation* cll) {
   error_code io_error;
-
-  size_t channel_bytes = 0;
   std::optional<SliceSnapshot::DbRecord> record;
 
   RecordsPopper records_popper(push_to_sink_with_order_, &channel_);
 
   // we can not exit on io-error since we spawn fibers that push data.
   // TODO: we may signal them to stop processing and exit asap in case of the error.
-
-  while (record = records_popper.Pop()) {
+  while ((record = records_popper.Pop())) {
     if (io_error || cll->IsCancelled())
       continue;
 
@@ -1031,24 +1038,24 @@ error_code RdbSaver::Impl::ConsumeChannel(const Cancellation* cll) {
         continue;
 
       DVLOG(2) << "Pulled " << record->id;
-      channel_bytes += record->value.size();
+      stats_.pulled_bytes += record->value.size();
 
       io_error = sink_->Write(io::Buffer(record->value));
       if (io_error) {
         break;
       }
-    } while (record = records_popper.TryPop());
+    } while ((record = records_popper.TryPop()));
   }  // while (records_popper.Pop())
 
   size_t pushed_bytes = 0;
   for (auto& ptr : shard_snapshots_) {
     ptr->Join();
-    pushed_bytes += ptr->channel_bytes();
+    pushed_bytes += ptr->pushed_bytes();
   }
 
   DCHECK(!record.has_value() || !channel_.TryPop(*record));
 
-  VLOG(1) << "Channel pulled bytes: " << channel_bytes << " pushed bytes: " << pushed_bytes;
+  VLOG(1) << "Channel pulled bytes: " << stats_.pulled_bytes << " pushed bytes: " << pushed_bytes;
 
   return io_error;
 }
@@ -1056,9 +1063,17 @@ error_code RdbSaver::Impl::ConsumeChannel(const Cancellation* cll) {
 void RdbSaver::Impl::StartSnapshotting(bool stream_journal, const Cancellation* cll,
                                        EngineShard* shard) {
   auto& s = GetSnapshot(shard);
-  s.reset(new SliceSnapshot(&shard->db_slice(), &channel_, compression_mode_));
+  s = std::make_unique<SliceSnapshot>(&shard->db_slice(), &channel_, compression_mode_);
 
   s->Start(stream_journal, cll);
+}
+
+void RdbSaver::Impl::StartIncrementalSnapshotting(Context* cntx, EngineShard* shard,
+                                                  LSN start_lsn) {
+  auto& s = GetSnapshot(shard);
+  s = std::make_unique<SliceSnapshot>(&shard->db_slice(), &channel_, compression_mode_);
+
+  s->StartIncremental(cntx, start_lsn);
 }
 
 void RdbSaver::Impl::StopSnapshotting(EngineShard* shard) {
@@ -1079,6 +1094,17 @@ void RdbSaver::Impl::Cancel() {
   }
 
   snapshot->Join();
+}
+
+size_t RdbSaver::Impl::GetTotalBuffersSize() const {
+  DCHECK_EQ(shard_snapshots_.size(), 1u) << "Only supported for dragonfly replication";
+  auto& snapshot = shard_snapshots_.front();
+
+  // Calculate number of enqueued bytes as difference between pushed and pulled
+  size_t enqueued_bytes = snapshot->pushed_bytes() - stats_.pulled_bytes;
+  size_t serializer_bytes = snapshot->GetTotalBufferCapacity();
+
+  return enqueued_bytes + serializer_bytes;
 }
 
 void RdbSaver::Impl::FillFreqMap(RdbTypeFreqMap* dest) const {
@@ -1145,11 +1171,15 @@ void RdbSaver::StartSnapshotInShard(bool stream_journal, const Cancellation* cll
   impl_->StartSnapshotting(stream_journal, cll, shard);
 }
 
+void RdbSaver::StartIncrementalSnapshotInShard(Context* cntx, EngineShard* shard, LSN start_lsn) {
+  impl_->StartIncrementalSnapshotting(cntx, shard, start_lsn);
+}
+
 void RdbSaver::StopSnapshotInShard(EngineShard* shard) {
   impl_->StopSnapshotting(shard);
 }
 
-error_code RdbSaver::SaveHeader(const StringVec& lua_scripts) {
+error_code RdbSaver::SaveHeader(const GlobalData& glob_state) {
   char magic[16];
   // We should use RDB_VERSION here from rdb.h when we ditch redis 6 support
   // For now we serialize to an older version.
@@ -1157,22 +1187,25 @@ error_code RdbSaver::SaveHeader(const StringVec& lua_scripts) {
   CHECK_EQ(9u, sz);
 
   RETURN_ON_ERR(impl_->serializer()->WriteRaw(Bytes{reinterpret_cast<uint8_t*>(magic), sz}));
-  RETURN_ON_ERR(SaveAux(lua_scripts));
+  RETURN_ON_ERR(SaveAux(std::move(glob_state)));
 
   return error_code{};
 }
 
-error_code RdbSaver::SaveBody(const Cancellation* cll, RdbTypeFreqMap* freq_map) {
+error_code RdbSaver::SaveBody(Context* cntx, RdbTypeFreqMap* freq_map) {
   RETURN_ON_ERR(impl_->serializer()->FlushToSink(impl_->sink()));
 
   if (save_mode_ == SaveMode::SUMMARY) {
     impl_->serializer()->SendFullSyncCut();
   } else {
     VLOG(1) << "SaveBody , snapshots count: " << impl_->Size();
-    error_code io_error = impl_->ConsumeChannel(cll);
+    error_code io_error = impl_->ConsumeChannel(cntx->GetCancellation());
     if (io_error) {
       LOG(ERROR) << "io error " << io_error;
       return io_error;
+    }
+    if (cntx->GetError()) {
+      return cntx->GetError();
     }
   }
 
@@ -1186,7 +1219,7 @@ error_code RdbSaver::SaveBody(const Cancellation* cll, RdbTypeFreqMap* freq_map)
   return error_code{};
 }
 
-error_code RdbSaver::SaveAux(const StringVec& lua_scripts) {
+error_code RdbSaver::SaveAux(const GlobalData& glob_state) {
   static_assert(sizeof(void*) == 8, "");
 
   int aof_preamble = false;
@@ -1197,15 +1230,22 @@ error_code RdbSaver::SaveAux(const StringVec& lua_scripts) {
   RETURN_ON_ERR(SaveAuxFieldStrInt("redis-bits", 64));
 
   RETURN_ON_ERR(SaveAuxFieldStrInt("ctime", time(NULL)));
-
   RETURN_ON_ERR(SaveAuxFieldStrInt("used-mem", used_mem_current.load(memory_order_relaxed)));
-
   RETURN_ON_ERR(SaveAuxFieldStrInt("aof-preamble", aof_preamble));
 
   // Save lua scripts only in rdb or summary file
-  DCHECK(save_mode_ != SaveMode::SINGLE_SHARD || lua_scripts.empty());
-  for (const string& s : lua_scripts) {
+  DCHECK(save_mode_ != SaveMode::SINGLE_SHARD || glob_state.lua_scripts.empty());
+  for (const string& s : glob_state.lua_scripts)
     RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("lua", s));
+
+  if (save_mode_ == SaveMode::RDB) {
+    if (!glob_state.search_indices.empty())
+      LOG(WARNING) << "Dragonfly search index data is incompatible with the RDB format";
+  } else {
+    // Search index definitions are not tied to shards  and are saved in the summary file
+    DCHECK(save_mode_ != SaveMode::SINGLE_SHARD || glob_state.search_indices.empty());
+    for (const string& s : glob_state.search_indices)
+      RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("search-index", s));
   }
 
   // TODO: "repl-stream-db", "repl-id", "repl-offset"
@@ -1241,6 +1281,10 @@ error_code RdbSaver::SaveAuxFieldStrInt(string_view key, int64_t val) {
 
 void RdbSaver::Cancel() {
   impl_->Cancel();
+}
+
+size_t RdbSaver::GetTotalBuffersSize() const {
+  return impl_->GetTotalBuffersSize();
 }
 
 void RdbSerializer::AllocateCompressorOnce() {

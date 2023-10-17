@@ -15,11 +15,10 @@ using namespace std;
 
 namespace dfly::search {
 
-AstTermNode::AstTermNode(string term)
-    : term{term}, pattern{"\\b" + term + "\\b", std::regex::icase} {
+AstTermNode::AstTermNode(string term) : term{term} {
 }
 
-AstRangeNode::AstRangeNode(int64_t lo, int64_t hi) : lo{lo}, hi{hi} {
+AstRangeNode::AstRangeNode(double lo, double hi) : lo{lo}, hi{hi} {
 }
 
 AstNegateNode::AstNegateNode(AstNode&& node) : node{make_unique<AstNode>(move(node))} {
@@ -56,9 +55,18 @@ AstTagsNode::AstTagsNode(AstExpr&& l, std::string tag) {
   tags.push_back(move(tag));
 }
 
-AstKnnNode::AstKnnNode(AstNode&& filter, size_t limit, std::string field, FtVector vec)
-    : filter{make_unique<AstNode>(move(filter))}, limit{limit}, field{field.substr(1)}, vector{move(
-                                                                                            vec)} {
+AstKnnNode::AstKnnNode(uint32_t limit, std::string_view field, OwnedFtVector vec,
+                       std::string_view score_alias)
+    : filter{nullptr},
+      limit{limit},
+      field{field.substr(1)},
+      vec{std::move(vec)},
+      score_alias{score_alias} {
+}
+
+AstKnnNode::AstKnnNode(AstNode&& filter, AstKnnNode&& self) {
+  *this = std::move(self);
+  this->filter = make_unique<AstNode>(std::move(filter));
 }
 
 }  // namespace dfly::search

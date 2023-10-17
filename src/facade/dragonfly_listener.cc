@@ -4,6 +4,12 @@
 
 #include "facade/dragonfly_listener.h"
 
+#include <openssl/err.h>
+
+#include <memory>
+
+#include "facade/tls_error.h"
+
 #ifdef DFLY_USE_SSL
 #include <openssl/ssl.h>
 #endif
@@ -29,6 +35,8 @@ ABSL_FLAG(string, tls_ca_cert_dir, "", "ca signed certificates directory");
 ABSL_FLAG(uint32_t, tcp_keepalive, 300,
           "the period in seconds of inactivity after which keep-alives are triggerred,"
           "the duration until an inactive connection is terminated is twice the specified time");
+
+ABSL_DECLARE_FLAG(bool, primary_port_http_enabled);
 
 #if 0
 enum TlsClientAuth {
@@ -58,6 +66,7 @@ using absl::GetFlag;
 namespace {
 
 #ifdef DFLY_USE_SSL
+
 // To connect: openssl s_client -state -crlf -connect 127.0.0.1:6380
 SSL_CTX* CreateSslServerCntx() {
   const auto& tls_key_file = GetFlag(FLAGS_tls_key_file);
@@ -69,13 +78,13 @@ SSL_CTX* CreateSslServerCntx() {
   SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
   unsigned mask = SSL_VERIFY_NONE;
 
-  CHECK_EQ(1, SSL_CTX_use_PrivateKey_file(ctx, tls_key_file.c_str(), SSL_FILETYPE_PEM));
+  DFLY_SSL_CHECK(1 == SSL_CTX_use_PrivateKey_file(ctx, tls_key_file.c_str(), SSL_FILETYPE_PEM));
   const auto& tls_cert_file = GetFlag(FLAGS_tls_cert_file);
 
   if (!tls_cert_file.empty()) {
     // TO connect with redis-cli you need both tls-key-file and tls-cert-file
     // loaded. Use `redis-cli --tls -p 6380 --insecure  PING` to test
-    CHECK_EQ(1, SSL_CTX_use_certificate_chain_file(ctx, tls_cert_file.c_str()));
+    DFLY_SSL_CHECK(1 == SSL_CTX_use_certificate_chain_file(ctx, tls_cert_file.c_str()));
   }
 
   const auto tls_ca_cert_file = GetFlag(FLAGS_tls_ca_cert_file);
@@ -83,11 +92,11 @@ SSL_CTX* CreateSslServerCntx() {
   if (!tls_ca_cert_file.empty() || !tls_ca_cert_dir.empty()) {
     const auto* file = tls_ca_cert_file.empty() ? nullptr : tls_ca_cert_file.data();
     const auto* dir = tls_ca_cert_dir.empty() ? nullptr : tls_ca_cert_dir.data();
-    CHECK_EQ(1, SSL_CTX_load_verify_locations(ctx, file, dir));
+    DFLY_SSL_CHECK(1 == SSL_CTX_load_verify_locations(ctx, file, dir));
     mask = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
   }
 
-  CHECK_EQ(1, SSL_CTX_set_cipher_list(ctx, "DEFAULT"));
+  DFLY_SSL_CHECK(1 == SSL_CTX_set_cipher_list(ctx, "DEFAULT"));
 
   SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 
@@ -95,7 +104,7 @@ SSL_CTX* CreateSslServerCntx() {
 
   SSL_CTX_set_verify(ctx, mask, NULL);
 
-  CHECK_EQ(1, SSL_CTX_set_dh_auto(ctx, 1));
+  DFLY_SSL_CHECK(1 == SSL_CTX_set_dh_auto(ctx, 1));
 
   return ctx;
 }
@@ -107,8 +116,13 @@ bool ConfigureKeepAlive(int fd) {
     return false;
 
   val = absl::GetFlag(FLAGS_tcp_keepalive);
+#ifdef __APPLE__
+  if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &val, sizeof(val)) < 0)
+    return false;
+#else
   if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &val, sizeof(val)) < 0)
     return false;
+#endif
 
   /* Send next probes after the specified interval. Note that we set the
    * delay as interval / 3, as we send three probes before detecting
@@ -128,17 +142,24 @@ bool ConfigureKeepAlive(int fd) {
 
 }  // namespace
 
-Listener::Listener(Protocol protocol, ServiceInterface* si) : service_(si), protocol_(protocol) {
+Listener::Listener(Protocol protocol, ServiceInterface* si, Role role)
+    : service_(si), protocol_(protocol) {
 #ifdef DFLY_USE_SSL
   if (GetFlag(FLAGS_tls)) {
     OPENSSL_init_ssl(OPENSSL_INIT_SSL_DEFAULT, NULL);
     ctx_ = CreateSslServerCntx();
   }
 #endif
-
-  http_base_.reset(new HttpListener<>);
-  http_base_->set_resource_prefix("http://static.dragonflydb.io/data-plane");
-  si->ConfigureHttpHandlers(http_base_.get());
+  role_ = role;
+  // We only set the HTTP interface for:
+  // 1. Privileged users (on privileged listener)
+  // 2. Main listener (if enabled)
+  const bool is_main_enabled = GetFlag(FLAGS_primary_port_http_enabled);
+  if (IsPrivilegedInterface() || (IsMainInterface() && is_main_enabled)) {
+    http_base_ = std::make_unique<HttpListener<>>();
+    http_base_->set_resource_prefix("http://static.dragonflydb.io/data-plane");
+    si->ConfigureHttpHandlers(http_base_.get(), IsPrivilegedInterface());
+  }
 }
 
 Listener::~Listener() {
@@ -160,6 +181,7 @@ error_code Listener::ConfigureServerSocket(int fd) {
   bool success = ConfigureKeepAlive(fd);
 
   if (!success) {
+#ifndef __APPLE__
     int myerr = errno;
 
     int socket_type;
@@ -170,6 +192,7 @@ error_code Listener::ConfigureServerSocket(int fd) {
         socket_type != AF_UNIX) {
       LOG(WARNING) << "Could not configure keep alive " << SafeErrorMessage(myerr);
     }
+#endif
   }
 
   return error_code{};
@@ -199,6 +222,14 @@ bool Listener::AwaitDispatches(absl::Duration timeout,
     ThisFiber::SleepFor(100us);
   }
   return false;
+}
+
+bool Listener::IsPrivilegedInterface() const {
+  return role_ == Role::PRIVILEGED;
+}
+
+bool Listener::IsMainInterface() const {
+  return role_ == Role::MAIN;
 }
 
 void Listener::PreShutdown() {
@@ -264,6 +295,10 @@ void Listener::OnConnectionClose(util::Connection* conn) {
     min_cnt_thread_id_ = id;
     return;
   }
+}
+
+void Listener::OnMaxConnectionsReached(util::FiberSocketBase* sock) {
+  sock->Write(io::Buffer("-ERR max number of clients reached\r\n"));
 }
 
 // We can limit number of threads handling dragonfly connections.

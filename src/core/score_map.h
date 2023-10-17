@@ -77,22 +77,37 @@ class ScoreMap : public DenseSet {
     }
   };
 
-  // Returns true if field was added
-  // otherwise updates its value and returns false.
-  bool AddOrUpdate(std::string_view field, double value);
+  // Returns pointer to the internal objest and the insertion result.
+  // i.e. true if field was added, otherwise updates its value and returns false.
+  std::pair<void*, bool> AddOrUpdate(std::string_view field, double value);
 
   // Returns true if field was added
   // false, if already exists. In that case no update is done.
-  bool AddOrSkip(std::string_view field, double value);
+  std::pair<void*, bool> AddOrSkip(std::string_view field, double value);
 
-  bool Erase(std::string_view s1);
+  void* AddUnique(std::string_view field, double value);
+
+  bool Erase(std::string_view field) {
+    return EraseInternal(&field, 1);
+  }
+
+  bool Erase(sds field) {
+    return EraseInternal(field, 0);
+  }
 
   /// @brief  Returns value of the key or nullptr if key not found.
   /// @param key
   /// @return sds
   std::optional<double> Find(std::string_view key);
 
-  void Clear();
+  // returns the internal object if found, otherwise nullptr.
+  void* FindObj(sds ele) {
+    return FindInternal(ele, Hash(ele, 0), 0);
+  }
+
+  void Clear() {
+    ClearInternal();
+  }
 
   iterator begin() {
     return iterator{this, false};

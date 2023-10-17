@@ -79,6 +79,12 @@ class Connection : public util::Connection {
 
   struct MonitorMessage : public std::string {};
 
+  struct AclUpdateMessage {
+    std::vector<std::string> username;
+    std::vector<uint32_t> categories;
+    std::vector<std::vector<uint64_t>> commands;
+  };
+
   struct PipelineMessage {
     PipelineMessage(size_t nargs, size_t capacity) : args(nargs), storage(capacity) {
     }
@@ -111,10 +117,10 @@ class Connection : public util::Connection {
 
     bool IsPipelineMsg() const;
 
-    std::variant<MonitorMessage, PubMessagePtr, PipelineMessagePtr> handle;
+    std::variant<MonitorMessage, PubMessagePtr, PipelineMessagePtr, AclUpdateMessage> handle;
   };
 
-  enum Phase { READ_SOCKET, PROCESS };
+  enum Phase { SETUP, READ_SOCKET, PROCESS, NUM_PHASES };
 
  public:
   // Add PubMessage to dispatch queue.
@@ -124,7 +130,10 @@ class Connection : public util::Connection {
   // Add monitor message to dispatch queue.
   void SendMonitorMessageAsync(std::string);
 
-  // Must be called before Send_Async to ensure the connection dispatch queue is not overfilled.
+  // Add acl update to dispatch queue.
+  void SendAclUpdateAsync(AclUpdateMessage msg);
+
+  // Must be called before SendAsync to ensure the connection dispatch queue is not overfilled.
   // Blocks until free space is available.
   void EnsureAsyncMemoryBudget();
 
@@ -147,19 +156,23 @@ class Connection : public util::Connection {
   bool IsCurrentlyDispatching() const;
 
   std::string GetClientInfo(unsigned thread_id) const;
-  std::string RemoteEndpointStr() const;
+  std::string GetClientInfo() const;
+  virtual std::string RemoteEndpointStr() const;
   std::string RemoteEndpointAddress() const;
   std::string LocalBindAddress() const;
 
   uint32_t GetClientId() const;
   // Virtual because behavior is overridden in test_utils.
-  virtual bool IsAdmin() const;
+  virtual bool IsPrivileged() const;
+
+  bool IsMain() const;
 
   Protocol protocol() const {
     return protocol_;
   }
 
   void SetName(std::string name) {
+    util::ThisFiber::SetName(absl::StrCat("DflyConnection_", name));
     name_ = std::move(name);
   }
 
@@ -180,6 +193,18 @@ class Connection : public util::Connection {
   struct DispatchOperations;
   struct DispatchCleanup;
   struct Shutdown;
+
+  // Keeps track of total per-thread sizes of dispatch queues to
+  // limit memory taken up by pipelined / pubsub commands and slow down clients
+  // producing them to quickly via EnsureAsyncMemoryBudget.
+  struct QueueBackpressure {
+    // Block until memory usage is below limit, can be called from any thread
+    void EnsureBelowLimit();
+
+    dfly::EventCount ec;
+    std::atomic_size_t bytes = 0;
+    size_t limit = 0;
+  };
 
  private:
   // Check protocol and handle connection.
@@ -218,12 +243,12 @@ class Connection : public util::Connection {
   PipelineMessagePtr GetFromPipelinePool();
 
  private:
+  std::pair<std::string, std::string> GetClientInfoBeforeAfterTid() const;
   std::deque<MessageHandle> dispatch_q_;  // dispatch queue
   dfly::EventCount evc_;                  // dispatch queue waker
   util::fb2::Fiber dispatch_fb_;          // dispatch fiber (if started)
 
-  std::atomic_uint64_t dispatch_q_bytes_ = 0;  // memory usage of all entries
-  dfly::EventCount evc_bp_;                    // backpressure for memory limit
+  size_t dispatch_q_cmds_count_;  // how many queued async commands
 
   base::IoBuf io_buf_;  // used in io loop and parsers
   std::unique_ptr<RedisParser> redis_parser_;
@@ -240,7 +265,7 @@ class Connection : public util::Connection {
 
   time_t creation_time_, last_interaction_;
 
-  Phase phase_;
+  Phase phase_ = SETUP;
   std::string name_;
 
   // A pointer to the ConnectionContext object if it exists. Some connections (like http
@@ -256,12 +281,17 @@ class Connection : public util::Connection {
   RespVec tmp_parse_args_;
   CmdArgVec tmp_cmd_vec_;
 
+  // Pointer to corresponding queue backpressure struct.
+  // Needed for access from different threads by EnsureAsyncMemoryBudget().
+  QueueBackpressure* queue_backpressure_;
+
   // Pooled pipieline messages per-thread.
   // Aggregated while handling pipelines,
   // graudally released while handling regular commands.
   static thread_local std::vector<PipelineMessagePtr> pipeline_req_pool_;
-};
 
-void RespToArgList(const RespVec& src, CmdArgVec* dest);
+  // Per-thread queue backpressure structs.
+  static thread_local QueueBackpressure tl_queue_backpressure_;
+};
 
 }  // namespace facade

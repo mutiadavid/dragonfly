@@ -305,6 +305,10 @@ template <typename T> class BPTreePath {
     depth_ = 0;
   }
 
+  bool Empty() const {
+    return depth_ == 0;
+  }
+
   std::pair<BPTreeNode<T>*, unsigned> Last() const {
     assert(depth_ > 0u);
     return {record_[depth_ - 1].node, record_[depth_ - 1].pos};
@@ -334,6 +338,10 @@ template <typename T> class BPTreePath {
     return Last().first->Key(Last().second);
   }
 
+  /// @brief Returns the rank of the path's terminal item.
+  /// Requires that the path is valid and has a terminal item.
+  uint32_t Rank() const;
+
   /// @brief Advances the path to the next item.
   /// @return true if succeeded, false if reached the end.
   bool Next();
@@ -362,6 +370,18 @@ template <typename Comp>
 auto BPTreeNode<T>::BSearch(KeyT key, Comp&& cmp_op) const -> SearchResult {
   uint16_t lo = 0;
   uint16_t hi = num_items_;
+  assert(hi > 0);
+
+  // optimization: check the last item first.
+  int cmp_res = cmp_op(key, Key(hi - 1));
+  if (cmp_res >= 0) {
+    return cmp_res > 0 ? SearchResult{.index = hi, .found = false}
+                       : SearchResult{.index = uint16_t(hi - 1), .found = true};
+  }
+
+  // key < Key(hi - 1)
+
+  --hi;
   while (lo < hi) {
     uint16_t mid = (lo + hi) >> 1;
     assert(mid < hi);
@@ -381,7 +401,7 @@ auto BPTreeNode<T>::BSearch(KeyT key, Comp&& cmp_op) const -> SearchResult {
   }
   assert(lo == hi);
 
-  return {.index = hi, .found = 0};
+  return {.index = hi, .found = false};
 }
 
 template <typename T> void BPTreeNode<T>::ShiftRight(unsigned index) {
@@ -688,6 +708,25 @@ template <typename T> void BPTreeNode<T>::MergeFromRight(KeyT key, BPTreeNode<T>
   }
   num_items_ += 1 + right->NumItems();
   right->num_items_ = 0;
+}
+
+template <typename T> uint32_t BPTreePath<T>::Rank() const {
+  uint32_t rank = 0;
+  unsigned bound = Depth();
+
+  for (unsigned i = 0; i < bound; ++i) {
+    auto* node = Node(i);
+    unsigned pos = Position(i);
+    if (!node->IsLeaf()) {
+      unsigned delta = (i == bound - 1) ? 1 : 0;
+      for (unsigned j = 0; j < pos + delta; ++j) {
+        rank += node->Child(j)->TreeCount();
+      }
+    }
+    rank += pos;
+  }
+
+  return rank;
 }
 
 template <typename T> bool BPTreePath<T>::Next() {

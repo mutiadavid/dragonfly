@@ -5,6 +5,7 @@
 #include "server/conn_context.h"
 
 #include "base/logging.h"
+#include "server/acl/acl_commands_def.h"
 #include "server/command_registry.h"
 #include "server/engine_shard_set.h"
 #include "server/server_family.h"
@@ -20,13 +21,13 @@ using namespace facade;
 StoredCmd::StoredCmd(const CommandId* cid, CmdArgList args, facade::ReplyMode mode)
     : cid_{cid}, buffer_{}, sizes_(args.size()), reply_mode_{mode} {
   size_t total_size = 0;
-  for (auto args : args)
-    total_size += args.size();
-
+  for (auto args : args) {
+    total_size += args.size() + 1;  // +1 for null terminator
+  }
   buffer_.resize(total_size);
   char* next = buffer_.data();
   for (unsigned i = 0; i < args.size(); i++) {
-    memcpy(next, args[i].data(), args[i].size());
+    memcpy(next, args[i].data(), args[i].size() + 1);
     sizes_[i] = args[i].size();
     next += args[i].size();
   }
@@ -76,6 +77,27 @@ const CommandId* StoredCmd::Cid() const {
   return cid_;
 }
 
+ConnectionContext::ConnectionContext(::io::Sink* stream, facade::Connection* owner)
+    : facade::ConnectionContext(stream, owner) {
+  if (owner) {
+    skip_acl_validation = owner->IsPrivileged();
+  }
+  acl_commands = std::vector<uint64_t>(acl::NumberOfFamilies(), acl::ALL_COMMANDS);
+}
+
+ConnectionContext::ConnectionContext(const ConnectionContext* owner, Transaction* tx,
+                                     facade::CapturingReplyBuilder* crb)
+    : facade::ConnectionContext(nullptr, nullptr), transaction{tx} {
+  acl_commands = std::vector<uint64_t>(acl::NumberOfFamilies(), acl::ALL_COMMANDS);
+  if (tx) {  // If we have a carrier transaction, this context is used for squashing
+    DCHECK(owner);
+    conn_state.db_index = owner->conn_state.db_index;
+    conn_state.squashing_info = {owner};
+  }
+  auto* prev_reply_builder = Inject(crb);
+  CHECK_EQ(prev_reply_builder, nullptr);
+}
+
 void ConnectionContext::ChangeMonitor(bool start) {
   // This will either remove or register a new connection
   // at the "top level" thread --> ServerState context
@@ -83,10 +105,10 @@ void ConnectionContext::ChangeMonitor(bool start) {
   // then notify all other threads that there is a change in the number of monitors
   auto& my_monitors = ServerState::tlocal()->Monitors();
   if (start) {
-    my_monitors.Add(owner());
+    my_monitors.Add(conn());
   } else {
-    VLOG(1) << "connection " << owner()->GetClientId() << " no longer needs to be monitored";
-    my_monitors.Remove(owner());
+    VLOG(1) << "connection " << conn()->GetClientId() << " no longer needs to be monitored";
+    my_monitors.Remove(conn());
   }
   // Tell other threads that about the change in the number of connection that we monitor
   shard_set->pool()->Await(

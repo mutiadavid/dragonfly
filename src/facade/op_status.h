@@ -27,9 +27,8 @@ enum class OpStatus : uint16_t {
   ENTRIES_ADDED_SMALL,
   INVALID_NUMERIC_RESULT,
   CANCELLED,
+  AT_LEAST_ONE_KEY,
 };
-
-const char* DebugString(OpStatus op);
 
 class OpResultBase {
  public:
@@ -125,6 +124,8 @@ template <typename V> class OpResultTyped : public OpResult<V> {
 inline bool operator==(OpStatus st, const OpResultBase& ob) {
   return ob.operator==(st);
 }
+
+std::string_view StatusToMsg(OpStatus status);
 
 }  // namespace facade
 

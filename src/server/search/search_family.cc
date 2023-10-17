@@ -6,17 +6,23 @@
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/strings/ascii.h>
+#include <absl/strings/match.h>
+#include <absl/strings/str_format.h>
 
 #include <atomic>
 #include <jsoncons/json.hpp>
+#include <jsoncons_ext/jsonpath/jsonpath.hpp>
 #include <variant>
 #include <vector>
 
 #include "base/logging.h"
 #include "core/json_object.h"
 #include "core/search/search.h"
+#include "core/search/vector_utils.h"
+#include "facade/cmd_arg_parser.h"
 #include "facade/error.h"
 #include "facade/reply_builder.h"
+#include "server/acl/acl_commands_def.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/container_utils.h"
@@ -31,82 +37,178 @@ using namespace facade;
 
 namespace {
 
-const absl::flat_hash_map<string_view, search::Schema::FieldType> kSchemaTypes = {
-    {"TAG"sv, search::Schema::TAG},
-    {"TEXT"sv, search::Schema::TEXT},
-    {"NUMERIC"sv, search::Schema::NUMERIC},
-    {"VECTOR"sv, search::Schema::VECTOR}};
+static const set<string_view> kIgnoredOptions = {"WEIGHT", "SEPARATOR"};
 
-static const set<string_view> kIgnoredOptions = {"WEIGHT", "SEPARATOR", "TYPE", "DIM",
-                                                 "DISTANCE_METRIC"};
+bool IsValidJsonPath(string_view path) {
+  error_code ec;
+  jsoncons::jsonpath::make_expression<JsonType>(path, ec);
+  return !ec;
+}
 
-optional<search::Schema> ParseSchemaOrReply(CmdArgList args, ConnectionContext* cntx) {
+search::SchemaField::VectorParams ParseVectorParams(CmdArgParser* parser) {
+  size_t dim = 0;
+  auto sim = search::VectorSimilarity::L2;
+  size_t capacity = 1000;
+
+  bool use_hnsw = parser->ToUpper().Next().Case("HNSW", true).Case("FLAT", false);
+  size_t num_args = parser->Next().Int<size_t>();
+
+  for (size_t i = 0; i * 2 < num_args; i++) {
+    parser->ToUpper();
+
+    if (parser->Check("DIM").ExpectTail(1)) {
+      dim = parser->Next().Int<size_t>();
+      continue;
+    }
+
+    if (parser->Check("DISTANCE_METRIC").ExpectTail(1)) {
+      sim = parser->Next()
+                .Case("L2", search::VectorSimilarity::L2)
+                .Case("COSINE", search::VectorSimilarity::COSINE);
+      continue;
+    }
+
+    if (parser->Check("INITIAL_CAP").ExpectTail(1)) {
+      capacity = parser->Next().Int<size_t>();
+      continue;
+    }
+
+    parser->Skip(2);
+  }
+
+  return {use_hnsw, dim, sim, capacity};
+}
+
+optional<search::Schema> ParseSchemaOrReply(DocIndex::DataType type, CmdArgParser parser,
+                                            ConnectionContext* cntx) {
   search::Schema schema;
-  for (size_t i = 0; i < args.size(); i++) {
-    string_view field = ArgS(args, i);
-    if (i++ >= args.size()) {
-      (*cntx)->SendError("No field type for field: " + string{field});
+
+  while (parser.HasNext()) {
+    string_view field = parser.Next();
+    string_view field_alias = field;
+
+    // Verify json path is correct
+    if (type == DocIndex::JSON && !IsValidJsonPath(field)) {
+      (*cntx)->SendError("Bad json path: " + string{field});
       return nullopt;
     }
 
-    ToUpper(&args[i]);
-    string_view type_str = ArgS(args, i);
-    auto it = kSchemaTypes.find(type_str);
-    if (it == kSchemaTypes.end()) {
+    parser.ToUpper();
+
+    // AS [alias]
+    if (parser.Check("AS").ExpectTail(1).NextUpper())
+      field_alias = parser.Next();
+
+    // Determine type
+    string_view type_str = parser.Next();
+    auto type = ParseSearchFieldType(type_str);
+    if (!type) {
       (*cntx)->SendError("Invalid field type: " + string{type_str});
       return nullopt;
     }
 
-    // Skip {algorithm} {dim} flags
-    if (it->second == search::Schema::VECTOR)
-      i += 2;
-
-    // Skip all trailing ignored parameters
-    while (i + 2 < args.size() && kIgnoredOptions.count(ArgS(args, i + 1)) > 0) {
-      i += 2;
+    // Vector fields include: {algorithm} num_args args...
+    search::SchemaField::ParamsVariant params = std::monostate{};
+    if (*type == search::SchemaField::VECTOR) {
+      auto vector_params = ParseVectorParams(&parser);
+      if (!parser.HasError() && vector_params.dim == 0) {
+        (*cntx)->SendError("Knn vector dimension cannot be zero");
+        return nullopt;
+      }
+      params = std::move(vector_params);
     }
 
-    schema.fields[field] = it->second;
+    // Flags: check for SORTABLE and NOINDEX
+    uint8_t flags = 0;
+    while (parser.HasNext()) {
+      if (parser.Check("NOINDEX").IgnoreCase()) {
+        flags |= search::SchemaField::NOINDEX;
+        continue;
+      }
+
+      if (parser.Check("SORTABLE").IgnoreCase()) {
+        flags |= search::SchemaField::SORTABLE;
+        continue;
+      }
+
+      break;
+    }
+
+    // Skip all trailing ignored parameters
+    while (kIgnoredOptions.count(parser.Peek()) > 0)
+      parser.Skip(2);
+
+    schema.fields[field] = {*type, flags, string{field_alias}, std::move(params)};
+  }
+
+  // Build field name mapping table
+  for (const auto& [field_ident, field_info] : schema.fields)
+    schema.field_names[field_info.short_name] = field_ident;
+
+  if (auto err = parser.Error(); err) {
+    (*cntx)->SendError(err->MakeReply());
+    return nullopt;
   }
 
   return schema;
 }
 
-optional<SearchParams> ParseSearchParamsOrReply(CmdArgList args, ConnectionContext* cntx) {
-  size_t limit_offset = 0, limit_total = 10;
-  search::FtVector knn_vector;
+optional<SearchParams> ParseSearchParamsOrReply(CmdArgParser parser, ConnectionContext* cntx) {
+  SearchParams params;
 
-  for (size_t i = 0; i < args.size(); i++) {
-    ToUpper(&args[i]);
-
+  while (parser.ToUpper().HasNext()) {
     // [LIMIT offset total]
-    if (ArgS(args, i) == "LIMIT") {
-      if (i + 2 >= args.size()) {
-        (*cntx)->SendError(kSyntaxErr);
-        return nullopt;
+    if (parser.Check("LIMIT").ExpectTail(2)) {
+      params.limit_offset = parser.Next().Int<size_t>();
+      params.limit_total = parser.Next().Int<size_t>();
+      continue;
+    }
+
+    // RETURN {num} [{ident} AS {name}...]
+    if (parser.Check("RETURN").ExpectTail(1)) {
+      size_t num_fields = parser.Next().Int<size_t>();
+      params.return_fields = SearchParams::FieldReturnList{};
+      while (params.return_fields->size() < num_fields) {
+        string_view ident = parser.Next();
+        string_view alias = parser.Check("AS").IgnoreCase().ExpectTail(1) ? parser.Next() : ident;
+        params.return_fields->emplace_back(ident, alias);
       }
-      if (!absl::SimpleAtoi(ArgS(args, i + 1), &limit_offset) ||
-          !absl::SimpleAtoi(ArgS(args, i + 2), &limit_total)) {
-        (*cntx)->SendError(kInvalidIntErr);
-        return nullopt;
-      }
-      i += 2;
+      continue;
+    }
+
+    // NOCONTENT
+    if (parser.Check("NOCONTENT")) {
+      params.return_fields = SearchParams::FieldReturnList{};
       continue;
     }
 
     // [PARAMS num(ignored) name(ignored) knn_vector]
-    if (ArgS(args, i) == "PARAMS") {
-      if (i + 3 >= args.size()) {
-        (*cntx)->SendError(kSyntaxErr);
-        return nullopt;
+    if (parser.Check("PARAMS").ExpectTail(1)) {
+      size_t num_args = parser.Next().Int<size_t>();
+      while (parser.HasNext() && params.query_params.Size() * 2 < num_args) {
+        string_view k = parser.Next();
+        string_view v = parser.Next();
+        params.query_params[k] = v;
       }
-      knn_vector = BytesToFtVector(ArgS(args, i + 3));
-      i += 3;
       continue;
     }
+
+    if (parser.Check("SORTBY").ExpectTail(1)) {
+      params.sort_option =
+          search::SortOption{string{parser.Next()}, bool(parser.Check("DESC").IgnoreCase())};
+      continue;
+    }
+
+    // Unsupported parameters are ignored for now
+    parser.Skip(1);
   }
 
-  return SearchParams{limit_offset, limit_total, move(knn_vector)};
+  if (auto err = parser.Error(); err) {
+    (*cntx)->SendError(err->MakeReply());
+    return nullopt;
+  }
+
+  return params;
 }
 
 void SendSerializedDoc(const SerializedSearchDoc& doc, ConnectionContext* cntx) {
@@ -124,12 +226,15 @@ void ReplyWithResults(const SearchParams& params, absl::Span<SearchResult> resul
   for (const auto& shard_docs : results)
     total_count += shard_docs.total_hits;
 
-  size_t response_count =
+  size_t result_count =
       min(total_count - min(total_count, params.limit_offset), params.limit_total);
 
   facade::SinkReplyBuilder::ReplyAggregator agg{cntx->reply_builder()};
 
-  (*cntx)->StartArray(response_count * 2 + 1);
+  bool ids_only = params.IdsOnly();
+  size_t reply_size = ids_only ? (result_count + 1) : (result_count * 2 + 1);
+
+  (*cntx)->StartArray(reply_size);
   (*cntx)->SendLong(total_count);
 
   size_t sent = 0;
@@ -142,96 +247,103 @@ void ReplyWithResults(const SearchParams& params, absl::Span<SearchResult> resul
         continue;
       }
 
-      if (sent++ >= response_count)
+      if (sent++ >= result_count)
         return;
 
-      SendSerializedDoc(serialized_doc, cntx);
+      if (ids_only)
+        (*cntx)->SendBulkString(serialized_doc.key);
+      else
+        SendSerializedDoc(serialized_doc, cntx);
     }
   }
 }
 
-void ReplyKnn(size_t knn_limit, const SearchParams& params, absl::Span<SearchResult> results,
-              ConnectionContext* cntx) {
-  vector<const SerializedSearchDoc*> docs;
-  for (const auto& shard_results : results) {
-    for (const auto& doc : shard_results.docs) {
+void ReplySorted(search::AggregationInfo agg, const SearchParams& params,
+                 absl::Span<SearchResult> results, ConnectionContext* cntx) {
+  size_t total = 0;
+  vector<SerializedSearchDoc*> docs;
+  for (auto& shard_results : results) {
+    total += shard_results.total_hits;
+    for (auto& doc : shard_results.docs) {
       docs.push_back(&doc);
     }
   }
 
-  partial_sort(docs.begin(),
-               docs.begin() + min(params.limit_offset + params.limit_total, knn_limit), docs.end(),
-               [](const auto* l, const auto* r) { return l->knn_distance < r->knn_distance; });
-  docs.resize(min(docs.size(), knn_limit));
+  size_t agg_limit = agg.limit.value_or(total);
+  size_t prefix = min(params.limit_offset + params.limit_total, agg_limit);
 
-  size_t response_count =
-      min(docs.size() - min(docs.size(), params.limit_offset), params.limit_total);
+  partial_sort(docs.begin(), docs.begin() + min(docs.size(), prefix), docs.end(),
+               [desc = agg.descending](const auto* l, const auto* r) {
+                 return desc ? (*l >= *r) : (*l < *r);
+               });
 
-  (*cntx)->StartArray(response_count * 2 + 1);
-  (*cntx)->SendLong(docs.size());
-  for (auto* doc : absl::MakeSpan(docs).subspan(params.limit_offset, response_count)) {
+  docs.resize(min(docs.size(), agg_limit));
+
+  size_t start_idx = min(params.limit_offset, docs.size());
+  size_t result_count = min(docs.size() - start_idx, params.limit_total);
+  bool ids_only = params.IdsOnly();
+  size_t reply_size = ids_only ? (result_count + 1) : (result_count * 2 + 1);
+
+  // Clear score alias if it's excluded from return values
+  if (!params.ShouldReturnField(agg.alias))
+    agg.alias = "";
+
+  facade::SinkReplyBuilder::ReplyAggregator agg_reply{cntx->reply_builder()};
+
+  (*cntx)->StartArray(reply_size);
+  (*cntx)->SendLong(min(total, agg_limit));
+  for (auto* doc : absl::MakeSpan(docs).subspan(start_idx, result_count)) {
+    if (ids_only) {
+      (*cntx)->SendBulkString(doc->key);
+      continue;
+    }
+
+    if (!agg.alias.empty() && holds_alternative<float>(doc->score))
+      doc->values[agg.alias] = absl::StrCat(get<float>(doc->score));
+
     SendSerializedDoc(*doc, cntx);
   }
-}
-
-string_view GetSchemaTypeName(search::Schema::FieldType type) {
-  for (const auto& [iname, itype] : kSchemaTypes) {
-    if (itype == type)
-      return iname;
-  }
-  return ""sv;
 }
 
 }  // namespace
 
 void SearchFamily::FtCreate(CmdArgList args, ConnectionContext* cntx) {
-  string_view idx_name = ArgS(args, 0);
-
   DocIndex index{};
 
-  for (size_t i = 1; i < args.size(); i++) {
-    ToUpper(&args[i]);
+  CmdArgParser parser{args};
+  string_view idx_name = parser.Next();
 
-    // [ON HASH | JSON]
-    if (ArgS(args, i) == "ON") {
-      if (++i >= args.size())
-        return (*cntx)->SendError(kSyntaxErr);
-
-      ToUpper(&args[i]);
-      string_view type = ArgS(args, i);
-      if (type == "HASH")
-        index.type = DocIndex::HASH;
-      else if (type == "JSON")
-        index.type = DocIndex::JSON;
-      else
-        return (*cntx)->SendError("Invalid rule type: " + string{type});
+  while (parser.ToUpper().HasNext()) {
+    // ON HASH | JSON
+    if (parser.Check("ON").ExpectTail(1)) {
+      index.type =
+          parser.ToUpper().Next().Case("HASH"sv, DocIndex::HASH).Case("JSON"sv, DocIndex::JSON);
       continue;
     }
 
-    // [PREFIX count prefix [prefix ...]]
-    if (ArgS(args, i) == "PREFIX") {
-      if (i + 2 >= args.size())
-        return (*cntx)->SendError(kSyntaxErr);
-
-      if (ArgS(args, ++i) != "1")
+    // PREFIX count prefix [prefix ...]
+    if (parser.Check("PREFIX").ExpectTail(2)) {
+      if (size_t num = parser.Next().Int<size_t>(); num != 1)
         return (*cntx)->SendError("Multiple prefixes are not supported");
-
-      index.prefix = ArgS(args, ++i);
+      index.prefix = string(parser.Next());
       continue;
     }
 
-    // [SCHEMA]
-    if (ArgS(args, i) == "SCHEMA") {
-      if (i++ >= args.size())
-        return (*cntx)->SendError("Empty schema");
-
-      auto schema = ParseSchemaOrReply(args.subspan(i), cntx);
+    // SCHEMA
+    if (parser.Check("SCHEMA")) {
+      auto schema = ParseSchemaOrReply(index.type, parser.Tail(), cntx);
       if (!schema)
         return;
       index.schema = move(*schema);
       break;  // SCHEMA always comes last
     }
+
+    // Unsupported parameters are ignored for now
+    parser.Skip(1);
   }
+
+  if (auto err = parser.Error(); err)
+    return (*cntx)->SendError(err->MakeReply());
 
   auto idx_ptr = make_shared<DocIndex>(move(index));
   cntx->transaction->ScheduleSingleHop([idx_name, idx_ptr](auto* tx, auto* es) {
@@ -264,6 +376,7 @@ void SearchFamily::FtInfo(CmdArgList args, ConnectionContext* cntx) {
 
   atomic_uint num_notfound{0};
   vector<DocIndexInfo> infos(shard_set->size());
+
   cntx->transaction->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
     auto* index = es->search_indices()->GetIndex(idx_name);
     if (index == nullptr)
@@ -278,11 +391,14 @@ void SearchFamily::FtInfo(CmdArgList args, ConnectionContext* cntx) {
   if (num_notfound > 0u)
     return (*cntx)->SendError("Unknown index name");
 
-  DCHECK(infos.front().schema.fields == infos.back().schema.fields);
+  DCHECK(infos.front().base_index.schema.fields.size() ==
+         infos.back().base_index.schema.fields.size());
 
   size_t total_num_docs = 0;
   for (const auto& info : infos)
     total_num_docs += info.num_docs;
+
+  const auto& schema = infos.front().base_index.schema;
 
   (*cntx)->StartCollection(3, RedisReplyBuilder::MAP);
 
@@ -290,10 +406,11 @@ void SearchFamily::FtInfo(CmdArgList args, ConnectionContext* cntx) {
   (*cntx)->SendSimpleString(idx_name);
 
   (*cntx)->SendSimpleString("fields");
-  const auto& fields = infos.front().schema.fields;
-  (*cntx)->StartArray(fields.size());
-  for (auto [field, type] : fields) {
-    string_view reply[3] = {string_view{field}, "type"sv, GetSchemaTypeName(type)};
+  (*cntx)->StartArray(schema.fields.size());
+  for (const auto& [field_ident, field_info] : schema.fields) {
+    string_view reply[6] = {"identifier", string_view{field_ident},
+                            "attribute",  field_info.short_name,
+                            "type"sv,     SearchFieldTypeToString(field_info.type)};
     (*cntx)->SendSimpleStrArr(reply);
   }
 
@@ -324,7 +441,8 @@ void SearchFamily::FtSearch(CmdArgList args, ConnectionContext* cntx) {
     return;
 
   search::SearchAlgorithm search_algo;
-  if (!search_algo.Init(query_str, {move(params->knn_vector)}))
+  search::SortOption* sort_opt = params->sort_option.has_value() ? &*params->sort_option : nullptr;
+  if (!search_algo.Init(query_str, &params->query_params, sort_opt))
     return (*cntx)->SendError("Query syntax error");
 
   // Because our coordinator thread may not have a shard, we can't check ahead if the index exists.
@@ -342,23 +460,119 @@ void SearchFamily::FtSearch(CmdArgList args, ConnectionContext* cntx) {
   if (index_not_found.load())
     return (*cntx)->SendError(string{index_name} + ": no such index");
 
-  if (auto knn_limit = search_algo.HasKnn(); knn_limit)
-    ReplyKnn(*knn_limit, *params, absl::MakeSpan(docs), cntx);
+  for (const auto& res : docs) {
+    if (res.error)
+      return (*cntx)->SendError(std::move(*res.error));
+  }
+
+  if (auto agg = search_algo.HasAggregation(); agg)
+    ReplySorted(std::move(*agg), *params, absl::MakeSpan(docs), cntx);
   else
     ReplyWithResults(*params, absl::MakeSpan(docs), cntx);
 }
 
+void SearchFamily::FtProfile(CmdArgList args, ConnectionContext* cntx) {
+  string_view index_name = ArgS(args, 0);
+  string_view query_str = ArgS(args, 3);
+
+  optional<SearchParams> params = ParseSearchParamsOrReply(args.subspan(4), cntx);
+  if (!params.has_value())
+    return;
+
+  search::SearchAlgorithm search_algo;
+  search::SortOption* sort_opt = params->sort_option.has_value() ? &*params->sort_option : nullptr;
+  if (!search_algo.Init(query_str, &params->query_params, sort_opt))
+    return (*cntx)->SendError("Query syntax error");
+
+  search_algo.EnableProfiling();
+
+  absl::Time start = absl::Now();
+  atomic_uint total_docs = 0;
+  atomic_uint total_serialized = 0;
+
+  vector<pair<search::AlgorithmProfile, absl::Duration>> results(shard_set->size());
+
+  cntx->transaction->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
+    auto* index = es->search_indices()->GetIndex(index_name);
+    if (!index)
+      return OpStatus::OK;
+
+    auto shard_start = absl::Now();
+    auto res = index->Search(t->GetOpArgs(es), *params, &search_algo);
+
+    total_docs.fetch_add(res.total_hits);
+    total_serialized.fetch_add(res.docs.size());
+
+    DCHECK(res.profile);
+    results[es->shard_id()] = {std::move(*res.profile), absl::Now() - shard_start};
+
+    return OpStatus::OK;
+  });
+
+  auto took = absl::Now() - start;
+
+  (*cntx)->StartArray(results.size() + 1);
+
+  // General stats
+  (*cntx)->StartCollection(3, RedisReplyBuilder::MAP);
+  (*cntx)->SendBulkString("took");
+  (*cntx)->SendLong(absl::ToInt64Microseconds(took));
+  (*cntx)->SendBulkString("hits");
+  (*cntx)->SendLong(total_docs);
+  (*cntx)->SendBulkString("serialized");
+  (*cntx)->SendLong(total_serialized);
+
+  // Per-shard stats
+  for (const auto& [profile, shard_took] : results) {
+    (*cntx)->StartCollection(2, RedisReplyBuilder::MAP);
+    (*cntx)->SendBulkString("took");
+    (*cntx)->SendLong(absl::ToInt64Microseconds(shard_took));
+    (*cntx)->SendBulkString("tree");
+
+    for (size_t i = 0; i < profile.events.size(); i++) {
+      const auto& event = profile.events[i];
+
+      size_t children = 0;
+      for (size_t j = i + 1; j < profile.events.size(); j++) {
+        if (profile.events[j].depth == event.depth)
+          break;
+        if (profile.events[j].depth == event.depth + 1)
+          children++;
+      }
+
+      if (children > 0)
+        (*cntx)->StartArray(2);
+
+      (*cntx)->SendSimpleString(
+          absl::StrFormat("t=%-10u n=%-10u %s", event.micros, event.num_processed, event.descr));
+
+      if (children > 0)
+        (*cntx)->StartArray(children);
+    }
+  }
+}
+
 #define HFUNC(x) SetHandler(&SearchFamily::x)
+
+// Redis search is a module. Therefore we introduce dragonfly extension search
+// to set as the default for the search family of commands. More sensible defaults,
+// should also be considered in the future
 
 void SearchFamily::Register(CommandRegistry* registry) {
   using CI = CommandId;
 
-  *registry << CI{"FT.CREATE", CO::GLOBAL_TRANS, -2, 0, 0, 0}.HFUNC(FtCreate)
-            << CI{"FT.DROPINDEX", CO::GLOBAL_TRANS, -2, 0, 0, 0}.HFUNC(FtDropIndex)
-            << CI{"FT.INFO", CO::GLOBAL_TRANS, 2, 0, 0, 0}.HFUNC(FtInfo)
+  // Disable journaling, because no-key-transactional enables it by default
+  const uint32_t kReadOnlyMask =
+      CO::NO_KEY_TRANSACTIONAL | CO::NO_KEY_TX_SPAN_ALL | CO::NO_AUTOJOURNAL;
+
+  registry->StartFamily();
+  *registry << CI{"FT.CREATE", CO::GLOBAL_TRANS, -2, 0, 0, 0, acl::FT_SEARCH}.HFUNC(FtCreate)
+            << CI{"FT.DROPINDEX", CO::GLOBAL_TRANS, -2, 0, 0, 0, acl::FT_SEARCH}.HFUNC(FtDropIndex)
+            << CI{"FT.INFO", kReadOnlyMask, 2, 0, 0, 0, acl::FT_SEARCH}.HFUNC(FtInfo)
             // Underscore same as in RediSearch because it's "temporary" (long time already)
-            << CI{"FT._LIST", CO::GLOBAL_TRANS, 1, 0, 0, 0}.HFUNC(FtList)
-            << CI{"FT.SEARCH", CO::GLOBAL_TRANS, -3, 0, 0, 0}.HFUNC(FtSearch);
+            << CI{"FT._LIST", kReadOnlyMask, 1, 0, 0, 0, acl::FT_SEARCH}.HFUNC(FtList)
+            << CI{"FT.SEARCH", kReadOnlyMask, -3, 0, 0, 0, acl::FT_SEARCH}.HFUNC(FtSearch)
+            << CI{"FT.PROFILE", kReadOnlyMask, -4, 0, 0, 0, acl::FT_SEARCH}.HFUNC(FtProfile);
 }
 
 }  // namespace dfly

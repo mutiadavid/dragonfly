@@ -74,14 +74,17 @@ class MultiCommandSquasher {
   ConnectionContext* cntx_;     // Underlying context
   Service* service_;
 
-  // underlying cid (exec or eval) for executing batch hops, nullptr for non-atomic
-  const CommandId* base_cid_;
+  bool atomic_;                // Wheter working in any of the atomic modes
+  const CommandId* base_cid_;  // underlying cid (exec or eval) for executing batch hops
 
   bool verify_commands_ = false;  // Whether commands need to be verified before execution
   bool error_abort_ = false;      // Abort upon receiving error
 
   std::vector<ShardExecInfo> sharded_;
   std::vector<ShardId> order_;  // reply order for squashed cmds
+
+  size_t num_squashed_ = 0;
+  size_t num_shards_ = 0;
 
   std::vector<MutableSlice> tmp_keylist_;
 };

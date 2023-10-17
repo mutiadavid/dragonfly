@@ -14,6 +14,7 @@
 #include "core/json_object.h"
 #include "facade/dragonfly_connection.h"
 #include "facade/error.h"
+#include "server/acl/acl_commands_def.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/dflycmd.h"
@@ -26,7 +27,7 @@
 
 ABSL_FLAG(std::string, cluster_announce_ip, "", "ip that cluster commands announce to the client");
 
-ABSL_DECLARE_FLAG(uint32_t, port);
+ABSL_DECLARE_FLAG(int32_t, port);
 
 namespace dfly {
 namespace {
@@ -69,7 +70,7 @@ ClusterShard ClusterFamily::GetEmulatedShardInfo(ConnectionContext* cntx) const 
     DCHECK(etl.is_master);
     std::string cluster_announce_ip = absl::GetFlag(FLAGS_cluster_announce_ip);
     std::string preferred_endpoint =
-        cluster_announce_ip.empty() ? cntx->owner()->LocalBindAddress() : cluster_announce_ip;
+        cluster_announce_ip.empty() ? cntx->conn()->LocalBindAddress() : cluster_announce_ip;
 
     info.master = {.id = server_family_->master_id(),
                    .ip = preferred_endpoint,
@@ -84,7 +85,7 @@ ClusterShard ClusterFamily::GetEmulatedShardInfo(ConnectionContext* cntx) const 
     info.master = {
         .id = etl.remote_client_id_, .ip = replication_info->host, .port = replication_info->port};
     info.replicas.push_back({.id = server_family_->master_id(),
-                             .ip = cntx->owner()->LocalBindAddress(),
+                             .ip = cntx->conn()->LocalBindAddress(),
                              .port = static_cast<uint16_t>(absl::GetFlag(FLAGS_port))});
   }
 
@@ -377,7 +378,7 @@ void ClusterFamily::DflyCluster(CmdArgList args, ConnectionContext* cntx) {
     return (*cntx)->SendError(kClusterDisabled);
   }
 
-  if (cntx->owner() && !cntx->owner()->IsAdmin()) {
+  if (cntx->conn() && !cntx->conn()->IsPrivileged()) {
     return (*cntx)->SendError(kDflyClusterCmdPort);
   }
 
@@ -598,12 +599,22 @@ inline CommandId::Handler HandlerFunc(ClusterFamily* se, EngineFunc f) {
 
 #define HFUNC(x) SetHandler(HandlerFunc(this, &ClusterFamily::x))
 
+namespace acl {
+constexpr uint32_t kCluster = SLOW;
+// Reconsider to maybe more sensible defaults
+constexpr uint32_t kDflyCluster = ADMIN | SLOW;
+constexpr uint32_t kReadOnly = FAST | CONNECTION;
+constexpr uint32_t kReadWrite = FAST | CONNECTION;
+}  // namespace acl
+
 void ClusterFamily::Register(CommandRegistry* registry) {
-  *registry << CI{"CLUSTER", CO::READONLY, -2, 0, 0, 0}.HFUNC(Cluster)
-            << CI{"DFLYCLUSTER", CO::ADMIN | CO::GLOBAL_TRANS | CO::HIDDEN, -2, 0, 0, 0}.HFUNC(
-                   DflyCluster)
-            << CI{"READONLY", CO::READONLY, 1, 0, 0, 0}.HFUNC(ReadOnly)
-            << CI{"READWRITE", CO::READONLY, 1, 0, 0, 0}.HFUNC(ReadWrite);
+  registry->StartFamily();
+  *registry << CI{"CLUSTER", CO::READONLY, -2, 0, 0, 0, acl::kCluster}.HFUNC(Cluster)
+            << CI{"DFLYCLUSTER",    CO::ADMIN | CO::GLOBAL_TRANS | CO::HIDDEN, -2, 0, 0, 0,
+                  acl::kDflyCluster}
+                   .HFUNC(DflyCluster)
+            << CI{"READONLY", CO::READONLY, 1, 0, 0, 0, acl::kReadOnly}.HFUNC(ReadOnly)
+            << CI{"READWRITE", CO::READONLY, 1, 0, 0, 0, acl::kReadWrite}.HFUNC(ReadWrite);
 }
 
 }  // namespace dfly

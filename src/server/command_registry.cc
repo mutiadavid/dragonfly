@@ -11,7 +11,9 @@
 #include "base/bits.h"
 #include "base/flags.h"
 #include "base/logging.h"
+#include "facade/dragonfly_connection.h"
 #include "facade/error.h"
+#include "server/acl/acl_commands_def.h"
 #include "server/conn_context.h"
 #include "server/server_state.h"
 
@@ -19,6 +21,8 @@ using namespace std;
 ABSL_FLAG(vector<string>, rename_command, {},
           "Change the name of commands, format is: <cmd1_name>=<cmd1_new_name>, "
           "<cmd2_name>=<cmd2_new_name>");
+ABSL_FLAG(vector<string>, restricted_commands, {},
+          "Commands restricted to connections on the admin port");
 
 namespace dfly {
 
@@ -31,8 +35,8 @@ using absl::StrCat;
 using absl::StrSplit;
 
 CommandId::CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first_key,
-                     int8_t last_key, int8_t step)
-    : facade::CommandId(name, mask, arity, first_key, last_key, step) {
+                     int8_t last_key, int8_t step, uint32_t acl_categories)
+    : facade::CommandId(name, mask, arity, first_key, last_key, step, acl_categories) {
   if (mask & CO::ADMIN)
     opt_mask_ |= CO::NOSCRIPT;
 
@@ -41,7 +45,7 @@ CommandId::CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first
 }
 
 bool CommandId::IsTransactional() const {
-  if (first_key_ > 0 || (opt_mask_ & CO::GLOBAL_TRANS) || (opt_mask_ & CO::NO_KEY_JOURNAL))
+  if (first_key_ > 0 || (opt_mask_ & CO::GLOBAL_TRANS) || (opt_mask_ & CO::NO_KEY_TRANSACTIONAL))
     return true;
 
   if (name_ == "EVAL" || name_ == "EVALSHA" || name_ == "EXEC")
@@ -51,12 +55,22 @@ bool CommandId::IsTransactional() const {
 }
 
 void CommandId::Invoke(CmdArgList args, ConnectionContext* cntx) const {
-  uint64_t before = absl::GetCurrentTimeNanos();
-  handler_(std::move(args), cntx);
-  uint64_t after = absl::GetCurrentTimeNanos();
-  auto& ent = command_stats_[ServerState::tlocal()->thread_index()];
+  ServerState* ss = ServerState::tlocal();
+  int64_t before = absl::GetCurrentTimeNanos();
+  handler_(args, cntx);
+  int64_t after = absl::GetCurrentTimeNanos();
+  int64_t execution_time_micro_s = (after - before) / 1000;
+  const auto* conn = cntx->conn();
+  auto& ent = command_stats_[ss->thread_index()];
+  // TODO: we should probably discard more commands here,
+  // not just the blocking ones
+  if (!(opt_mask_ & CO::BLOCKING) && ss->log_slower_than_usec >= 0 &&
+      execution_time_micro_s > ss->log_slower_than_usec && conn != nullptr) {
+    ss->GetSlowLog().Add(name(), args, conn->GetName(), conn->RemoteEndpointStr(),
+                         execution_time_micro_s, after);
+  }
   ++ent.first;
-  ent.second += (after - before) / 1000;
+  ent.second += execution_time_micro_s;
 }
 
 optional<facade::ErrorReply> CommandId::Validate(CmdArgList tail_args) const {
@@ -86,6 +100,10 @@ CommandRegistry::CommandRegistry() {
       exit(1);
     }
   }
+
+  for (string name : GetFlag(FLAGS_restricted_commands)) {
+    restricted_cmds_.emplace(AsciiStrToUpper(name));
+  }
 }
 
 void CommandRegistry::Init(unsigned int thread_count) {
@@ -103,9 +121,26 @@ CommandRegistry& CommandRegistry::operator<<(CommandId cmd) {
     }
     k = it->second;
   }
+
+  if (restricted_cmds_.find(k) != restricted_cmds_.end()) {
+    cmd.SetRestricted(true);
+  }
+
+  family_of_commands_.back().push_back(std::string(k));
+  cmd.SetFamily(family_of_commands_.size() - 1);
+  cmd.SetBitIndex(1ULL << bit_index_++);
   CHECK(cmd_map_.emplace(k, std::move(cmd)).second) << k;
 
   return *this;
+}
+
+void CommandRegistry::StartFamily() {
+  family_of_commands_.push_back({});
+  bit_index_ = 0;
+}
+
+CommandRegistry::FamiliesVec CommandRegistry::GetFamilies() {
+  return std::move(family_of_commands_);
 }
 
 namespace CO {
@@ -140,8 +175,10 @@ const char* OptName(CO::CommandOpt fl) {
       return "variadic-keys";
     case NO_AUTOJOURNAL:
       return "custom-journal";
-    case NO_KEY_JOURNAL:
-      return "no-key-journal";
+    case NO_KEY_TRANSACTIONAL:
+      return "no-key-transactional";
+    case NO_KEY_TX_SPAN_ALL:
+      return "no-key-tx-span-all";
   }
   return "unknown";
 }
