@@ -26,7 +26,8 @@
   using dfly::search::Parser;
   using namespace std;
 
-  Parser::symbol_type make_INT64 (string_view, const Parser::location_type& loc);
+  Parser::symbol_type make_DOUBLE(string_view, const Parser::location_type& loc);
+  Parser::symbol_type make_UINT32(string_view, const Parser::location_type& loc);
   Parser::symbol_type make_StringLit(string_view src, const Parser::location_type& loc);
 %}
 
@@ -62,12 +63,14 @@ term_char [_]|\w
 "}"            return Parser::make_RCURLBR (loc());
 "|"            return Parser::make_OR_OP (loc());
 "KNN"          return Parser::make_KNN (loc());
+"AS"           return Parser::make_AS (loc());
 
--?[0-9]+       return make_INT64(matched_view(), loc());
+[0-9]+                   return make_UINT32(matched_view(), loc());
+[+-]?([0-9]*[.])?[0-9]+  return make_DOUBLE(matched_view(), loc());
 
 {dq}{str_char}*{dq}  return make_StringLit(matched_view(1, 1), loc());
 
-"$"{term_char}+ return Parser::make_PARAM(str(), loc());
+"$"{term_char}+ return ParseParam(str(), loc());
 "@"{term_char}+ return Parser::make_FIELD(str(), loc());
 
 {term_char}+   return Parser::make_TERM(str(), loc());
@@ -75,20 +78,26 @@ term_char [_]|\w
 <<EOF>>    return Parser::make_YYEOF(loc());
 %%
 
-Parser::symbol_type
-make_INT64 (string_view str, const Parser::location_type& loc)
-{
-  int64_t val = 0;
+Parser::symbol_type make_UINT32 (string_view str, const Parser::location_type& loc) {
+  uint32_t val = 0;
   if (!absl::SimpleAtoi(str, &val))
-    throw Parser::syntax_error (loc, "not an integer or out of range: " + string(str));
+    throw Parser::syntax_error (loc, "not an unsigned integer or out of range: " + string(str));
 
-  return Parser::make_INT64(val, loc);
+  return Parser::make_UINT32(val, loc);
+}
+
+Parser::symbol_type make_DOUBLE (string_view str, const Parser::location_type& loc) {
+  double val = 0;
+  if (!absl::SimpleAtod(str, &val))
+    throw Parser::syntax_error (loc, "not a double or out of range: " + string(str));
+
+  return Parser::make_DOUBLE(val, loc);
 }
 
 Parser::symbol_type make_StringLit(string_view src, const Parser::location_type& loc) {
   string res;
-  if (!absl::CUnescape(src, &res)) {
+  if (!absl::CUnescape(src, &res))
     throw Parser::syntax_error (loc, "bad escaped string: " + string(src));
-  }
+
   return Parser::make_TERM(res, loc);
 }

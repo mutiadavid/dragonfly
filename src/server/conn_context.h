@@ -7,6 +7,7 @@
 #include <absl/container/fixed_array.h>
 #include <absl/container/flat_hash_set.h>
 
+#include "acl/acl_commands_def.h"
 #include "core/fibers.h"
 #include "facade/conn_context.h"
 #include "facade/reply_capture.h"
@@ -18,6 +19,7 @@ namespace dfly {
 class EngineShardSet;
 class ConnectionContext;
 class ChannelStore;
+class Interpreter;
 struct FlowInfo;
 
 // Stores command id and arguments for delayed invocation.
@@ -80,12 +82,16 @@ struct ConnectionState {
 
     ExecState state = EXEC_INACTIVE;
     std::vector<StoredCmd> body;
-    // List of keys registered with WATCH
-    std::vector<std::pair<DbIndex, std::string>> watched_keys;
-    // Set if a watched key was changed before EXEC
-    std::atomic_bool watched_dirty = false;
-    // Number of times watch was called on an existing key.
-    uint32_t watched_existed = 0;
+
+    std::vector<std::pair<DbIndex, std::string>> watched_keys;  // List of keys registered by WATCH
+    std::atomic_bool watched_dirty = false;  // Set if a watched key was changed before EXEC
+    uint32_t watched_existed = 0;            // Number of times watch was called on an existing key
+
+    // If the transaction contains EVAL calls, preborrow an interpreter that will be used for all of
+    // them. This has to be done to avoid potentially blocking when borrowing interpreters amid
+    // executing the multi transaction, which can create deadlocks by blocking other transactions
+    // that already borrowed all available interpreters but wait for keys to be unlocked.
+    Interpreter* preborrowed_interpreter = nullptr;
   };
 
   // Lua-script related data.
@@ -123,35 +129,41 @@ struct ConnectionState {
     DflyVersion repl_version = DflyVersion::VER0;
   };
 
+  struct SquashingInfo {
+    // Pointer to the original underlying context of the base command.
+    // Only const access it possible for reading from multiple threads,
+    // each squashing thread has its own proxy context that contains this info.
+    const ConnectionContext* owner = nullptr;
+  };
+
   enum MCGetMask {
     FETCH_CAS_VER = 1,
   };
 
+ public:
   DbIndex db_index = 0;
 
   // used for memcache set/get commands.
   // For set op - it's the flag value we are storing along with the value.
   // For get op - we use it as a mask of MCGetMask values.
   uint32_t memcache_flag = 0;
+
   bool is_blocking = false;  // whether this connection is blocking on a command
 
   ExecInfo exec_info;
   ReplicationInfo replication_info;
 
+  std::optional<SquashingInfo> squashing_info;
   std::unique_ptr<ScriptInfo> script_info;
   std::unique_ptr<SubscribeInfo> subscribe_info;
 };
 
 class ConnectionContext : public facade::ConnectionContext {
  public:
-  ConnectionContext(::io::Sink* stream, facade::Connection* owner)
-      : facade::ConnectionContext(stream, owner) {
-  }
+  ConnectionContext(::io::Sink* stream, facade::Connection* owner);
 
-  ConnectionContext(Transaction* tx, facade::CapturingReplyBuilder* crb)
-      : facade::ConnectionContext(nullptr, nullptr), transaction{tx} {
-    delete Inject(crb);  // deletes the previous reply builder.
-  }
+  ConnectionContext(const ConnectionContext* owner, Transaction* tx,
+                    facade::CapturingReplyBuilder* crb);
 
   struct DebugInfo {
     uint32_t shards_count = 0;
@@ -187,6 +199,12 @@ class ConnectionContext : public facade::ConnectionContext {
 
   // Reference to a FlowInfo for this connection if from a master to a replica.
   FlowInfo* replication_flow;
+
+  std::string authed_username{"default"};
+  uint32_t acl_categories{acl::ALL};
+  std::vector<uint64_t> acl_commands;
+  // Skip ACL validation, used by internal commands and commands run on admin port
+  bool skip_acl_validation = false;
 
  private:
   void EnableMonitoring(bool enable) {

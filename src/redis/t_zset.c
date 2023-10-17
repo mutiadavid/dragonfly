@@ -79,7 +79,6 @@ static char kMaxStrData[] = "\110" "maxstring";
 sds cminstring = kMinStrData + 1;
 sds cmaxstring = kMaxStrData + 1;
 
-
 int zslLexValueGteMin(sds value, const zlexrangespec *spec);
 int zslLexValueLteMax(sds value, const zlexrangespec *spec);
 
@@ -741,27 +740,6 @@ sds lpGetObject(unsigned char *sptr) {
     }
 }
 
-/* Compare element in sorted set with given element. */
-int zzlCompareElements(unsigned char *eptr, unsigned char *cstr, unsigned int clen) {
-    unsigned char *vstr;
-    unsigned int vlen;
-    long long vlong;
-    unsigned char vbuf[32];
-    int minlen, cmp;
-
-    vstr = lpGetValue(eptr,&vlen,&vlong);
-    if (vstr == NULL) {
-        /* Store string representation of long long in buf. */
-        vlen = ll2string((char*)vbuf,sizeof(vbuf),vlong);
-        vstr = vbuf;
-    }
-
-    minlen = (vlen < clen) ? vlen : clen;
-    cmp = memcmp(vstr,cstr,minlen);
-    if (cmp == 0) return vlen-clen;
-    return cmp;
-}
-
 unsigned int zzlLength(unsigned char *zl) {
     return lpLength(zl)/2;
 }
@@ -1002,60 +980,6 @@ unsigned char *zzlFind(unsigned char *lp, sds ele, double *score) {
  * don't want to modify the one given as argument. */
 unsigned char *zzlDelete(unsigned char *zl, unsigned char *eptr) {
     return lpDeleteRangeWithEntry(zl,&eptr,2);
-}
-
-unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds ele, double score) {
-    unsigned char *sptr;
-    char scorebuf[128];
-    int scorelen;
-
-    scorelen = d2string(scorebuf,sizeof(scorebuf),score);
-    if (eptr == NULL) {
-        zl = lpAppend(zl,(unsigned char*)ele,sdslen(ele));
-        zl = lpAppend(zl,(unsigned char*)scorebuf,scorelen);
-    } else {
-        /* Insert member before the element 'eptr'. */
-        zl = lpInsertString(zl,(unsigned char*)ele,sdslen(ele),eptr,LP_BEFORE,&sptr);
-
-        /* Insert score after the member. */
-        zl = lpInsertString(zl,(unsigned char*)scorebuf,scorelen,sptr,LP_AFTER,NULL);
-    }
-    return zl;
-}
-
-/* Insert (element,score) pair in listpack. This function assumes the element is
- * not yet present in the list. */
-unsigned char *zzlInsert(unsigned char *zl, sds ele, double score) {
-    unsigned char *eptr = lpSeek(zl,0), *sptr;
-    double s;
-
-    while (eptr != NULL) {
-        sptr = lpNext(zl,eptr);
-        serverAssert(sptr != NULL);
-        s = zzlGetScore(sptr);
-
-        if (s > score) {
-            /* First element with score larger than score for element to be
-             * inserted. This means we should take its spot in the list to
-             * maintain ordering. */
-            zl = zzlInsertAt(zl,eptr,ele,score);
-            break;
-        } else if (s == score) {
-            /* Ensure lexicographical ordering for elements. */
-            if (zzlCompareElements(eptr,(unsigned char*)ele,sdslen(ele)) > 0) {
-                zl = zzlInsertAt(zl,eptr,ele,score);
-                break;
-            }
-        }
-
-        /* Move to next element. */
-        eptr = lpNext(zl,sptr);
-    }
-
-    /* Push on tail of list when it was not yet inserted. */
-    if (eptr == NULL)
-        zl = zzlInsertAt(zl,NULL,ele,score);
-    return zl;
 }
 
 unsigned char *zzlDeleteRangeByScore(unsigned char *zl, const zrangespec *range, unsigned long *deleted) {

@@ -8,6 +8,7 @@
 #include <absl/strings/str_cat.h>
 #include <double-conversion/double-to-string.h>
 
+#include "absl/strings/escaping.h"
 #include "base/logging.h"
 #include "facade/error.h"
 
@@ -53,13 +54,15 @@ void SinkReplyBuilder::Send(const iovec* v, uint32_t len) {
     bsize += v[i].iov_len;
   }
 
-  // Allow batching with up to 8K of data.
+  // Allow batching with up to kMaxBatchSize of data.
   if ((should_batch_ || should_aggregate_) && (batch_.size() + bsize < kMaxBatchSize)) {
+    batch_.reserve(batch_.size() + bsize);
     for (unsigned i = 0; i < len; ++i) {
       std::string_view src((char*)v[i].iov_base, v[i].iov_len);
-      DVLOG(2) << "Appending to stream " << src;
+      DVLOG(3) << "Appending to stream " << absl::CHexEscape(src);
       batch_.append(src.data(), src.size());
     }
+    DVLOG(2) << "Batched " << bsize << " bytes";
     return;
   }
 
@@ -71,7 +74,7 @@ void SinkReplyBuilder::Send(const iovec* v, uint32_t len) {
   if (batch_.empty()) {
     ec = sink_->Write(v, len);
   } else {
-    DVLOG(2) << "Sending batch to stream " << sink_ << "\n" << batch_;
+    DVLOG(3) << "Sending batch to stream :" << absl::CHexEscape(batch_);
 
     io_write_bytes_ += batch_.size();
 
@@ -84,6 +87,7 @@ void SinkReplyBuilder::Send(const iovec* v, uint32_t len) {
   }
 
   if (ec) {
+    DVLOG(1) << "Error writing to stream: " << ec.message();
     ec_ = ec;
   }
 }
@@ -92,6 +96,22 @@ void SinkReplyBuilder::SendRaw(std::string_view raw) {
   iovec v = {IoVec(raw)};
 
   Send(&v, 1);
+}
+
+void SinkReplyBuilder::SendError(ErrorReply error) {
+  if (error.status)
+    return SendError(*error.status);
+
+  string_view message_sv = visit([](auto&& str) -> string_view { return str; }, error.message);
+  SendError(message_sv, error.kind);
+}
+
+void SinkReplyBuilder::SendError(OpStatus status) {
+  if (status == OpStatus::OK) {
+    SendOk();
+  } else {
+    SendError(StatusToMsg(status));
+  }
 }
 
 void SinkReplyBuilder::SendRawVec(absl::Span<const std::string_view> msg_vec) {
@@ -104,17 +124,36 @@ void SinkReplyBuilder::SendRawVec(absl::Span<const std::string_view> msg_vec) {
   Send(arr.data(), msg_vec.size());
 }
 
+void SinkReplyBuilder::StartAggregate() {
+  DVLOG(1) << "StartAggregate";
+  should_aggregate_ = true;
+}
+
 void SinkReplyBuilder::StopAggregate() {
+  DVLOG(1) << "StopAggregate";
   should_aggregate_ = false;
 
-  if (should_batch_ || batch_.empty())
+  if (should_batch_)
+    return;
+
+  FlushBatch();
+}
+
+void SinkReplyBuilder::SetBatchMode(bool batch) {
+  DVLOG(1) << "SetBatchMode(" << (batch ? "true" : "false") << ")";
+  should_batch_ = batch;
+}
+
+void SinkReplyBuilder::FlushBatch() {
+  if (batch_.empty())
     return;
 
   error_code ec = sink_->Write(io::Buffer(batch_));
   batch_.clear();
-
-  if (ec)
+  if (ec) {
+    DVLOG(1) << "Error flushing to stream: " << ec.message();
     ec_ = ec;
+  }
 }
 
 MCReplyBuilder::MCReplyBuilder(::io::Sink* sink) : SinkReplyBuilder(sink), noreply_(false) {
@@ -159,7 +198,7 @@ void MCReplyBuilder::SendMGetResponse(absl::Span<const OptResp> arr) {
 }
 
 void MCReplyBuilder::SendError(string_view str, std::string_view type) {
-  SendSimpleString("ERROR");
+  SendSimpleString(absl::StrCat("SERVER_ERROR ", str));
 }
 
 void MCReplyBuilder::SendProtocolError(std::string_view str) {
@@ -220,14 +259,6 @@ void RedisReplyBuilder::SendError(string_view str, string_view err_type) {
   }
 }
 
-void RedisReplyBuilder::SendError(ErrorReply error) {
-  if (error.status)
-    return SendError(*error.status);
-
-  string_view message_sv = visit([](auto&& str) -> string_view { return str; }, error.message);
-  SendError(message_sv, error.kind);
-}
-
 void RedisReplyBuilder::SendProtocolError(std::string_view str) {
   SendError(absl::StrCat("-ERR Protocol error: ", str), "protocol_error");
 }
@@ -272,42 +303,6 @@ void RedisReplyBuilder::SendBulkString(std::string_view str) {
   iovec v[3] = {IoVec(lenpref), IoVec(str), IoVec(kCRLF)};
 
   return Send(v, ABSL_ARRAYSIZE(v));
-}
-
-std::string_view RedisReplyBuilder::StatusToMsg(OpStatus status) {
-  switch (status) {
-    case OpStatus::OK:
-      return "OK";
-    case OpStatus::KEY_NOTFOUND:
-      return kKeyNotFoundErr;
-    case OpStatus::WRONG_TYPE:
-      return kWrongTypeErr;
-    case OpStatus::OUT_OF_RANGE:
-      return kIndexOutOfRange;
-    case OpStatus::INVALID_FLOAT:
-      return kInvalidFloatErr;
-    case OpStatus::INVALID_INT:
-      return kInvalidIntErr;
-    case OpStatus::SYNTAX_ERR:
-      return kSyntaxErr;
-    case OpStatus::OUT_OF_MEMORY:
-      return kOutOfMemory;
-    case OpStatus::BUSY_GROUP:
-      return "-BUSYGROUP Consumer Group name already exists";
-    case OpStatus::INVALID_NUMERIC_RESULT:
-      return kInvalidNumericResult;
-    default:
-      LOG(ERROR) << "Unsupported status " << status;
-      return "Internal error";
-  }
-}
-
-void RedisReplyBuilder::SendError(OpStatus status) {
-  if (status == OpStatus::OK) {
-    SendOk();
-  } else {
-    SendError(StatusToMsg(status));
-  }
 }
 
 void RedisReplyBuilder::SendLong(long num) {
@@ -415,6 +410,8 @@ void RedisReplyBuilder::StartCollection(unsigned len, CollectionType type) {
       len *= 2;
     type = ARRAY;
   }
+
+  DVLOG(2) << "StartCollection(" << len << ", " << type << ")";
 
   // We do not want to send multiple packets for small responses because these
   // trigger TCP-related artifacts (e.g. Nagle's algorithm) that slow down the delivery of the whole

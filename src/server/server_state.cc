@@ -6,6 +6,8 @@
 
 #include <mimalloc.h>
 
+#include "server/acl/user_registry.h"
+
 extern "C" {
 #include "redis/zmalloc.h"
 }
@@ -20,6 +22,17 @@ ABSL_FLAG(uint32_t, interpreter_per_thread, 10, "Lua interpreters per thread");
 namespace dfly {
 
 __thread ServerState* ServerState::state_ = nullptr;
+
+ServerState::Stats& ServerState::Stats::operator+=(const ServerState::Stats& other) {
+  this->ooo_tx_cnt += other.ooo_tx_cnt;
+  this->eval_io_coordination_cnt += other.eval_io_coordination_cnt;
+  this->eval_shardlocal_coordination_cnt += other.eval_shardlocal_coordination_cnt;
+  this->eval_squashed_flushes += other.eval_squashed_flushes;
+  this->tx_schedule_cancel_cnt += other.tx_schedule_cancel_cnt;
+
+  static_assert(sizeof(Stats) == 5 * 8);
+  return *this;
+}
 
 void MonitorsRepo::Add(facade::Connection* connection) {
   VLOG(1) << "register connection "
@@ -60,10 +73,11 @@ ServerState::ServerState() : interpreter_mgr_{absl::GetFlag(FLAGS_interpreter_pe
 ServerState::~ServerState() {
 }
 
-void ServerState::Init(uint32_t thread_index) {
+void ServerState::Init(uint32_t thread_index, acl::UserRegistry* registry) {
   state_ = new ServerState();
   state_->gstate_ = GlobalState::ACTIVE;
   state_->thread_index_ = thread_index;
+  state_->user_registry = registry;
 }
 
 void ServerState::Destroy() {

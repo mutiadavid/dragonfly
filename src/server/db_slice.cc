@@ -38,6 +38,13 @@ void PerformDeletion(PrimeIterator del_it, ExpireIterator exp_it, EngineShard* s
     table->expire.Erase(exp_it);
   }
 
+  if (del_it->second.HasFlag()) {
+    if (table->mcflag.Erase(del_it->first) == 0) {
+      LOG(ERROR) << "Internal error, inconsistent state, mcflag should be present but not found "
+                 << del_it->first.ToString();
+    }
+  }
+
   DbTableStats& stats = table->stats;
   const PrimeValue& pv = del_it->second;
   if (pv.IsExternal()) {
@@ -52,8 +59,13 @@ void PerformDeletion(PrimeIterator del_it, ExpireIterator exp_it, EngineShard* s
   size_t value_heap_size = pv.MallocUsed();
   stats.inline_keys -= del_it->first.IsInline();
   stats.obj_memory_usage -= (del_it->first.MallocUsed() + value_heap_size);
-  if (pv.ObjType() == OBJ_STRING)
+  if (pv.ObjType() == OBJ_STRING) {
     stats.strval_memory_usage -= value_heap_size;
+  } else if (pv.ObjType() == OBJ_HASH && pv.Encoding() == kEncodingListPack) {
+    --stats.listpack_blob_cnt;
+  } else if (pv.ObjType() == OBJ_ZSET && pv.Encoding() == OBJ_ENCODING_LISTPACK) {
+    --stats.listpack_blob_cnt;
+  }
 
   if (ClusterConfig::IsEnabled()) {
     string tmp;
@@ -81,9 +93,13 @@ class PrimeEvictionPolicy {
   static constexpr bool can_gc = true;
 
   PrimeEvictionPolicy(const DbContext& cntx, bool can_evict, ssize_t mem_budget, ssize_t soft_limit,
-                      DbSlice* db_slice)
-      : db_slice_(db_slice), mem_budget_(mem_budget), soft_limit_(soft_limit), cntx_(cntx),
-        can_evict_(can_evict) {
+                      DbSlice* db_slice, bool apply_memory_limit)
+      : db_slice_(db_slice),
+        mem_budget_(mem_budget),
+        soft_limit_(soft_limit),
+        cntx_(cntx),
+        can_evict_(can_evict),
+        apply_memory_limit_(apply_memory_limit) {
   }
 
   // A hook function that is called every time a segment is full and requires splitting.
@@ -121,6 +137,7 @@ class PrimeEvictionPolicy {
   // unlike static constexpr can_evict, this parameter tells whether we can evict
   // items in runtime.
   const bool can_evict_;
+  const bool apply_memory_limit_;
 };
 
 class PrimeBumpPolicy {
@@ -132,10 +149,10 @@ class PrimeBumpPolicy {
 };
 
 bool PrimeEvictionPolicy::CanGrow(const PrimeTable& tbl) const {
-  if (mem_budget_ > soft_limit_)
+  if (!apply_memory_limit_ || mem_budget_ > soft_limit_)
     return true;
 
-  DCHECK_LT(tbl.size(), tbl.capacity());
+  DCHECK_LE(tbl.size(), tbl.capacity());
 
   // We take a conservative stance here -
   // we estimate how much memory we will take with the current capacity
@@ -144,7 +161,8 @@ bool PrimeEvictionPolicy::CanGrow(const PrimeTable& tbl) const {
   size_t new_available = (tbl.capacity() - tbl.size()) + PrimeTable::kSegCapacity;
   bool res = mem_budget_ >
              int64_t(PrimeTable::kSegBytes + db_slice_->bytes_per_object() * new_available * 1.1);
-  VLOG(1) << "available: " << new_available << ", res: " << res;
+  VLOG(2) << "available: " << new_available << ", res: " << res;
+
   return res;
 }
 
@@ -360,7 +378,7 @@ OpResult<pair<PrimeIterator, unsigned>> DbSlice::FindFirst(const Context& cntx, 
       return res.status();
   }
 
-  VLOG(1) << "FindFirst " << args.front() << " not found";
+  VLOG(2) << "FindFirst " << args.front() << " not found";
   return OpStatus::KEY_NOTFOUND;
 }
 
@@ -389,12 +407,27 @@ tuple<PrimeIterator, ExpireIterator, bool> DbSlice::AddOrFind2(const Context& cn
     }
   }
 
-  PrimeEvictionPolicy evp{cntx, (bool(caching_mode_) && !owner_->IsReplica()),
-                          int64_t(memory_budget_ - key.size()), ssize_t(soft_budget_limit_), this};
+  // In case we are loading from rdb file or replicating we want to disable conservative memory
+  // checks (inside PrimeEvictionPolicy::CanGrow) and reject insertions only after we pass max
+  // memory limit. When loading a snapshot created by the same server configuration (memory and
+  // number of shards) we will create a different dash table segment directory tree, because the
+  // tree shape is related to the order of entries insertion. Therefore when loading data from
+  // snapshot or from replication the conservative memory checks might fail as the new tree might
+  // have more segments. Because we dont want to fail loading a snapshot from the same server
+  // configuration we disable this checks on loading and replication.
+  bool apply_memory_limit =
+      !owner_->IsReplica() && !(ServerState::tlocal()->gstate() == GlobalState::LOADING);
+
+  PrimeEvictionPolicy evp{cntx,
+                          (bool(caching_mode_) && !owner_->IsReplica()),
+                          int64_t(memory_budget_ - key.size()),
+                          ssize_t(soft_budget_limit_),
+                          this,
+                          apply_memory_limit};
 
   // If we are over limit in non-cache scenario, just be conservative and throw.
-  if (!caching_mode_ && evp.mem_budget() < 0) {
-    VLOG(1) << "AddOrFind2: over limit, budget: " << evp.mem_budget();
+  if (apply_memory_limit && !caching_mode_ && evp.mem_budget() < 0) {
+    VLOG(2) << "AddOrFind2: over limit, budget: " << evp.mem_budget();
     events_.insertion_rejections++;
     throw bad_alloc();
   }
@@ -409,7 +442,7 @@ tuple<PrimeIterator, ExpireIterator, bool> DbSlice::AddOrFind2(const Context& cn
   try {
     tie(it, inserted) = db.prime.Insert(std::move(co_key), PrimeValue{}, evp);
   } catch (bad_alloc& e) {
-    VLOG(1) << "AddOrFind2: bad alloc exception, budget: " << evp.mem_budget();
+    VLOG(2) << "AddOrFind2: bad alloc exception, budget: " << evp.mem_budget();
     events_.insertion_rejections++;
 
     throw e;
@@ -442,6 +475,7 @@ tuple<PrimeIterator, ExpireIterator, bool> DbSlice::AddOrFind2(const Context& cn
       SlotId sid = ClusterConfig::KeySlot(key);
       db.slots_stats[sid].key_count += 1;
     }
+
     return make_tuple(it, ExpireIterator{}, true);
   }
 
@@ -464,7 +498,11 @@ tuple<PrimeIterator, ExpireIterator, bool> DbSlice::AddOrFind2(const Context& cn
       db.expire.Erase(expire_it);
 
       if (existing->second.HasFlag()) {
-        db.mcflag.Erase(existing->first);
+        if (db.mcflag.Erase(existing->first) == 0) {
+          LOG(ERROR)
+              << "Internal error, inconsistent state, mcflag should be present but not found "
+              << existing->first.ToString();
+        }
       }
 
       // Keep the entry but reset the object.
@@ -493,9 +531,6 @@ bool DbSlice::Del(DbIndex db_ind, PrimeIterator it) {
   }
 
   auto& db = db_arr_[db_ind];
-  if (it->second.HasFlag()) {
-    CHECK_EQ(1u, db->mcflag.Erase(it->first));
-  }
 
   auto obj_type = it->second.ObjType();
   if (doc_del_cb_ && (obj_type == OBJ_JSON || obj_type == OBJ_HASH)) {
@@ -638,7 +673,10 @@ bool DbSlice::UpdateExpire(DbIndex db_ind, PrimeIterator it, uint64_t at) {
 void DbSlice::SetMCFlag(DbIndex db_ind, PrimeKey key, uint32_t flag) {
   auto& db = *db_arr_[db_ind];
   if (flag == 0) {
-    db.mcflag.Erase(key);
+    if (db.mcflag.Erase(key) == 0) {
+      LOG(ERROR) << "Internal error, inconsistent state, mcflag should be present but not found "
+                 << key.ToString();
+    }
   } else {
     auto [it, inserted] = db.mcflag.Insert(std::move(key), flag);
     if (!inserted)
@@ -649,7 +687,12 @@ void DbSlice::SetMCFlag(DbIndex db_ind, PrimeKey key, uint32_t flag) {
 uint32_t DbSlice::GetMCFlag(DbIndex db_ind, const PrimeKey& key) const {
   auto& db = *db_arr_[db_ind];
   auto it = db.mcflag.Find(key);
-  return it.is_done() ? 0 : it->second;
+  if (it.is_done()) {
+    LOG(ERROR) << "Internal error, inconsistent state, mcflag should be present but not found "
+               << key.ToString();
+    return 0;
+  }
+  return it->second;
 }
 
 PrimeIterator DbSlice::AddNew(const Context& cntx, string_view key, PrimeValue obj,
@@ -804,7 +847,6 @@ void DbSlice::Release(IntentLock::Mode mode, const KeyLockArgs& lock_args) {
   if (lock_args.args.size() == 1) {
     string_view key = KeyLockArgs::GetLockKey(lock_args.args.front());
     ReleaseNormalized(mode, lock_args.db_index, key, 1);
-    uniq_keys_ = {key};
   } else {
     auto& lt = db_arr_[lock_args.db_index]->trans_locks;
     uniq_keys_.clear();
@@ -820,6 +862,7 @@ void DbSlice::Release(IntentLock::Mode mode, const KeyLockArgs& lock_args) {
       }
     }
   }
+  uniq_keys_.clear();
 }
 
 bool DbSlice::CheckLock(IntentLock::Mode mode, DbIndex dbid, string_view key) const {
@@ -831,11 +874,9 @@ bool DbSlice::CheckLock(IntentLock::Mode mode, DbIndex dbid, string_view key) co
 }
 
 bool DbSlice::CheckLock(IntentLock::Mode mode, const KeyLockArgs& lock_args) const {
-  uniq_keys_.clear();
   const auto& lt = db_arr_[lock_args.db_index]->trans_locks;
   for (size_t i = 0; i < lock_args.args.size(); i += lock_args.key_step) {
     auto s = KeyLockArgs::GetLockKey(lock_args.args[i]);
-    uniq_keys_.insert(s);
     auto it = lt.find(s);
     if (it != lt.end() && !it->second.Check(mode)) {
       return false;
@@ -924,11 +965,20 @@ pair<PrimeIterator, ExpireIterator> DbSlice::ExpireIfNeeded(const Context& cntx,
   if (time_t(cntx.time_now_ms) < expire_time || owner_->IsReplica() || !expire_allowed_)
     return make_pair(it, expire_it);
 
+  string tmp_key_buf;
+  string_view tmp_key;
+
   // Replicate expiry
   if (auto journal = EngineShard::tlocal()->journal(); journal) {
-    std::string stash;
-    it->first.GetString(&stash);
-    RecordExpiry(cntx.db_index, stash);
+    tmp_key = it->first.GetSlice(&tmp_key_buf);
+    RecordExpiry(cntx.db_index, tmp_key);
+  }
+
+  auto obj_type = it->second.ObjType();
+  if (doc_del_cb_ && (obj_type == OBJ_JSON || obj_type == OBJ_HASH)) {
+    if (tmp_key.empty())
+      tmp_key = it->first.GetSlice(&tmp_key_buf);
+    doc_del_cb_(tmp_key, cntx, it->second);
   }
 
   PerformDeletion(it, expire_it, shard_owner(), db.get());

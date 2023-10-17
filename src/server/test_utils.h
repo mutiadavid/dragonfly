@@ -21,21 +21,22 @@ using namespace facade;
 class TestConnection : public facade::Connection {
  public:
   TestConnection(Protocol protocol, io::StringSink* sink);
+  std::string RemoteEndpointStr() const;
 
   void SendPubMessageAsync(PubMessage pmsg) final;
 
-  bool IsAdmin() const override {
-    return is_admin_;
+  bool IsPrivileged() const override {
+    return is_privileged_;
   }
-  void SetAdmin(bool is_admin) {
-    is_admin_ = is_admin;
+  void SetPrivileged(bool is_privileged) {
+    is_privileged_ = is_privileged;
   }
 
   std::vector<PubMessage> messages;
 
  private:
   io::StringSink* sink_;
-  bool is_admin_ = false;
+  bool is_privileged_ = false;
 };
 
 // The TransactionSuspension class is designed to facilitate the temporary suspension of commands
@@ -68,9 +69,9 @@ class BaseFamilyTest : public ::testing::Test {
     return Run(ArgSlice{list.begin(), list.size()});
   }
 
-  // Runs the command in a mocked admin connection
+  // Runs the command in a mocked privileged connection
   // Use for running commands which are allowed only when using admin connection.
-  RespExpr RunAdmin(std::initializer_list<const std::string_view> list);
+  RespExpr RunPrivileged(std::initializer_list<const std::string_view> list);
 
   RespExpr Run(ArgSlice list);
   RespExpr Run(absl::Span<std::string> list);
@@ -90,6 +91,8 @@ class BaseFamilyTest : public ::testing::Test {
   std::string CheckedString(ArgSlice list);
 
   void ResetService();
+
+  void ShutdownService();
 
   bool IsLocked(DbIndex db_index, std::string_view key) const;
   ConnectionContext::DebugInfo GetDebugInfo(const std::string& id) const;
@@ -121,10 +124,13 @@ class BaseFamilyTest : public ::testing::Test {
   static absl::flat_hash_set<std::string> GetLastUsedKeys();
   static void ExpectConditionWithinTimeout(const std::function<bool()>& condition,
                                            absl::Duration timeout = absl::Seconds(10));
+  Fiber ExpectConditionWithSuspension(const std::function<bool()>& condition);
 
   static unsigned NumLocked();
 
   static void SetTestFlag(std::string_view flag_name, std::string_view new_value);
+
+  void TestInitAclFam();
 
   std::unique_ptr<util::ProactorPool> pp_;
   std::unique_ptr<Service> service_;
@@ -136,6 +142,8 @@ class BaseFamilyTest : public ::testing::Test {
 
   std::vector<RespVec*> resp_vec_;
   bool single_response_ = true;
+  util::fb2::Fiber watchdog_fiber_;
+  util::fb2::Done watchdog_done_;
 };
 
 std::ostream& operator<<(std::ostream& os, const DbStats& stats);

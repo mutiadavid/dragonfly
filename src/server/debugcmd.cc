@@ -241,9 +241,13 @@ void DebugCmd::Run(CmdArgList args) {
         "    If <size> is specified then X character is concatenated multiple times to value:<num>",
         "    to meet value size.",
         "    If RAND is specified then value will be set to random hex string in specified size.",
-        "    If SLOTS is specified then create keys only in given slots range."
+        "    If SLOTS is specified then create keys only in given slots range.",
         "OBJHIST",
         "    Prints histogram of object sizes.",
+        "STACKTRACE",
+        "    Prints the stacktraces of all current fibers to the logs.",
+        "SHARDS",
+        "    Prints memory usage and key stats per shard, as well as min/max indicators.",
         "HELP",
         "    Prints this help.",
     };
@@ -280,9 +284,19 @@ void DebugCmd::Run(CmdArgList args) {
   if (subcmd == "TRANSACTION") {
     return TxAnalysis();
   }
+
   if (subcmd == "OBJHIST") {
     return ObjHist();
   }
+
+  if (subcmd == "STACKTRACE") {
+    return Stacktrace();
+  }
+
+  if (subcmd == "SHARDS") {
+    return Shards();
+  }
+
   string reply = UnknownSubCmd(subcmd, "DEBUG");
   return (*cntx_)->SendError(reply, kSyntaxErrType);
 }
@@ -722,6 +736,70 @@ void DebugCmd::ObjHist() {
 
   absl::StrAppend(&result, "___end object histogram___\n");
   (*cntx_)->SendBulkString(result);
+}
+
+void DebugCmd::Stacktrace() {
+  fb2::Mutex m;
+  shard_set->pool()->AwaitFiberOnAll([&m](unsigned index, ProactorBase* base) {
+    std::unique_lock lk(m);
+    fb2::detail::FiberInterface::PrintAllFiberStackTraces();
+  });
+  (*cntx_)->SendOk();
+}
+
+void DebugCmd::Shards() {
+  struct ShardInfo {
+    size_t used_memory = 0;
+    size_t key_count = 0;
+    size_t expire_count = 0;
+    size_t key_reads = 0;
+  };
+
+  vector<ShardInfo> infos(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    auto slice_stats = shard->db_slice().GetStats();
+    auto& stats = infos[shard->shard_id()];
+
+    stats.used_memory = shard->UsedMemory();
+    for (const auto& db_stats : slice_stats.db_stats) {
+      stats.key_count += db_stats.key_count;
+      stats.expire_count += db_stats.expire_count;
+    }
+    stats.key_reads = slice_stats.events.hits + slice_stats.events.misses;
+  });
+
+#define ADD_STAT(i, stat) absl::StrAppend(&out, "shard", i, "_", #stat, ": ", infos[i].stat, "\n");
+#define MAXMIN_STAT(stat)                                   \
+  {                                                         \
+    size_t minv = numeric_limits<size_t>::max();            \
+    size_t maxv = 0;                                        \
+    for (const auto& info : infos) {                        \
+      minv = min(minv, info.stat);                          \
+      maxv = max(maxv, info.stat);                          \
+    }                                                       \
+    absl::StrAppend(&out, "max_", #stat, ": ", maxv, "\n"); \
+    absl::StrAppend(&out, "min_", #stat, ": ", minv, "\n"); \
+  }
+
+  string out;
+  absl::StrAppend(&out, "num_shards: ", shard_set->size(), "\n");
+
+  for (size_t i = 0; i < infos.size(); i++) {
+    ADD_STAT(i, used_memory);
+    ADD_STAT(i, key_count);
+    ADD_STAT(i, expire_count);
+    ADD_STAT(i, key_reads);
+  }
+
+  MAXMIN_STAT(used_memory);
+  MAXMIN_STAT(key_count);
+  MAXMIN_STAT(expire_count);
+  MAXMIN_STAT(key_reads);
+
+#undef ADD_STAT
+#undef MAXMIN_STAT
+
+  (*cntx_)->SendBulkString(out);
 }
 
 }  // namespace dfly

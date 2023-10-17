@@ -9,6 +9,8 @@
 #include <absl/types/span.h>
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -132,6 +134,14 @@ struct TieredStats {
   size_t flush_skip_cnt = 0;
 
   TieredStats& operator+=(const TieredStats&);
+};
+
+struct SearchStats {
+  size_t used_memory = 0;
+  size_t num_indices = 0;
+  size_t num_entries = 0;
+
+  SearchStats& operator+=(const SearchStats&);
 };
 
 enum class GlobalState : uint8_t {

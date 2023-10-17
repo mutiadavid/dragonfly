@@ -26,13 +26,17 @@ class ServiceInterface {
   }
 
   virtual void DispatchCommand(CmdArgList args, ConnectionContext* cntx) = 0;
+
+  virtual void DispatchManyCommands(absl::Span<CmdArgList> args_list, ConnectionContext* cntx) = 0;
+
   virtual void DispatchMC(const MemcacheParser::Command& cmd, std::string_view value,
                           ConnectionContext* cntx) = 0;
 
   virtual ConnectionContext* CreateContext(util::FiberSocketBase* peer, Connection* owner) = 0;
+
   virtual ConnectionStats* GetThreadLocalConnectionStats() = 0;
 
-  virtual void ConfigureHttpHandlers(util::HttpListenerBase* base) {
+  virtual void ConfigureHttpHandlers(util::HttpListenerBase* base, bool is_privileged) {
   }
 
   virtual void OnClose(ConnectionContext* cntx) {

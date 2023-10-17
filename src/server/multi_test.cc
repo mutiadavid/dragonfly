@@ -70,6 +70,20 @@ TEST_F(MultiTest, MultiAndFlush) {
   EXPECT_THAT(Run({"FLUSHALL"}), ErrArg("'FLUSHALL' inside MULTI is not allowed"));
 }
 
+TEST_F(MultiTest, MultiWithError) {
+  EXPECT_THAT(Run({"multi"}), "OK");
+  EXPECT_THAT(Run({"set", "x", "y"}), "QUEUED");
+  EXPECT_THAT(Run({"set", "x"}), ErrArg("wrong number of arguments for 'set' command"));
+  EXPECT_THAT(Run({"exec"}), ErrArg("EXEC without MULTI"));
+
+  EXPECT_THAT(Run({"multi"}), "OK");
+  EXPECT_THAT(Run({"set", "z", "y"}), "QUEUED");
+  EXPECT_THAT(Run({"exec"}), "OK");
+
+  EXPECT_THAT(Run({"get", "x"}), ArgType(RespExpr::NIL));
+  EXPECT_THAT(Run({"get", "z"}), "y");
+}
+
 TEST_F(MultiTest, Multi) {
   RespExpr resp = Run({"multi"});
   ASSERT_EQ(resp, "OK");
@@ -364,6 +378,22 @@ TEST_F(MultiTest, Eval) {
   EXPECT_EQ(resp, "12345678912345-works");
   resp = Run({"eval", kGetScore, "1", "z1", "c"});
   EXPECT_EQ(resp, "12.5-works");
+
+  // Multiple calls in a Lua script
+  EXPECT_EQ(Run({"eval",
+                 R"(redis.call('set', 'foo', '42')
+                    return redis.call('get', 'foo'))",
+                 "1", "foo"}),
+            "42");
+
+  auto condition = [&]() { return service_->IsLocked(0, "foo"); };
+  auto fb = ExpectConditionWithSuspension(condition);
+  EXPECT_EQ(Run({"eval",
+                 R"(redis.call('set', 'foo', '42')
+                    return redis.call('get', 'foo'))",
+                 "1", "foo"}),
+            "42");
+  fb.Join();
 }
 
 TEST_F(MultiTest, Watch) {
@@ -481,9 +511,9 @@ TEST_F(MultiTest, MultiOOO) {
   // OOO works in LOCK_AHEAD mode.
   int mode = absl::GetFlag(FLAGS_multi_exec_mode);
   if (mode == Transaction::LOCK_AHEAD || mode == Transaction::NON_ATOMIC)
-    EXPECT_EQ(200, metrics.ooo_tx_transaction_cnt);
+    EXPECT_EQ(200, metrics.coordinator_stats.ooo_tx_cnt);
   else
-    EXPECT_EQ(0, metrics.ooo_tx_transaction_cnt);
+    EXPECT_EQ(0, metrics.coordinator_stats.ooo_tx_cnt);
 }
 
 // Lua scripts lock their keys ahead and thus can run out of order.
@@ -518,7 +548,9 @@ TEST_F(MultiTest, EvalOOO) {
   }
 
   auto metrics = GetMetrics();
-  EXPECT_EQ(1 + 2 * kTimes, metrics.ooo_tx_transaction_cnt);
+  auto sum = metrics.coordinator_stats.eval_io_coordination_cnt +
+             metrics.coordinator_stats.eval_shardlocal_coordination_cnt;
+  EXPECT_EQ(1 + 2 * kTimes, sum);
 }
 
 // Run MULTI/EXEC commands in parallel, where each command is:
@@ -588,7 +620,7 @@ TEST_F(MultiTest, ExecGlobalFallback) {
   Run({"set", "a", "1"});  // won't run ooo, because it became part of global
   Run({"move", "a", "1"});
   Run({"exec"});
-  EXPECT_EQ(0, GetMetrics().ooo_tx_transaction_cnt);
+  EXPECT_EQ(0, GetMetrics().coordinator_stats.ooo_tx_cnt);
 
   // Check non atomic mode does not fall back to global.
   absl::SetFlag(&FLAGS_multi_exec_mode, Transaction::NON_ATOMIC);
@@ -652,6 +684,26 @@ TEST_F(MultiTest, ScriptFlagsEmbedded) {
   )";
 
   EXPECT_THAT(Run({"eval", s2, "0"}), ErrArg("Invalid flag: this-is-an-error"));
+}
+
+TEST_F(MultiTest, MultiEvalModeConflict) {
+  if (auto mode = absl::GetFlag(FLAGS_multi_exec_mode); mode == Transaction::GLOBAL) {
+    GTEST_SKIP() << "Skipped MultiEvalModeConflict test because multi_exec_mode is global";
+    return;
+  }
+
+  const char* s1 = R"(
+  #!lua flags=allow-undeclared-keys
+  return redis.call('GET', 'random-key');
+)";
+
+  EXPECT_EQ(Run({"multi"}), "OK");
+  // Check eval finds script flags.
+  EXPECT_EQ(Run({"set", "random-key", "works"}), "QUEUED");
+  EXPECT_EQ(Run({"eval", s1, "0"}), "QUEUED");
+  EXPECT_THAT(Run({"exec"}),
+              RespArray(ElementsAre(
+                  "OK", ErrArg("Multi mode conflict when running eval in multi transaction"))));
 }
 
 // Run multi-exec transactions that move values from a source list
@@ -812,24 +864,16 @@ TEST_F(MultiTest, TestLockedKeys) {
     GTEST_SKIP() << "Skipped TestLockedKeys test because multi_exec_mode is not lock ahead";
     return;
   }
+  auto condition = [&]() { return service_->IsLocked(0, "key1") && service_->IsLocked(0, "key2"); };
+  auto fb = ExpectConditionWithSuspension(condition);
 
-  TransactionSuspension tx;
-  tx.Start();
-
-  auto fb0 = pp_->at(0)->LaunchFiber([&] {
-    EXPECT_EQ(Run({"multi"}), "OK");
-    EXPECT_EQ(Run({"set", "key1", "val1"}), "QUEUED");
-    EXPECT_EQ(Run({"set", "key2", "val2"}), "QUEUED");
-    EXPECT_THAT(Run({"exec"}), RespArray(ElementsAre("OK", "OK")));
-  });
-
-  ExpectConditionWithinTimeout(
-      [&]() { return service_->IsLocked(0, "key1") && service_->IsLocked(0, "key2"); });
-
-  tx.Terminate();
-  fb0.Join();
+  EXPECT_EQ(Run({"multi"}), "OK");
+  EXPECT_EQ(Run({"set", "key1", "val1"}), "QUEUED");
+  EXPECT_EQ(Run({"set", "key2", "val2"}), "QUEUED");
+  EXPECT_THAT(Run({"exec"}), RespArray(ElementsAre("OK", "OK")));
+  fb.Join();
   EXPECT_FALSE(service_->IsLocked(0, "key1"));
-  EXPECT_FALSE(service_->IsLocked(0, "key1"));
+  EXPECT_FALSE(service_->IsLocked(0, "key2"));
 }
 
 class MultiEvalTest : public BaseFamilyTest {

@@ -10,6 +10,7 @@
 #include <absl/strings/str_join.h>
 #include <absl/strings/str_replace.h>
 #include <absl/strings/strip.h>
+#include <croncpp.h>  // cron::cronexpr
 #include <sys/resource.h>
 
 #include <algorithm>
@@ -17,20 +18,25 @@
 #include <filesystem>
 #include <optional>
 
+#include "facade/error.h"
+#include "slowlog.h"
+
 extern "C" {
 #include "redis/redis_aux.h"
 }
 
 #include "base/flags.h"
 #include "base/logging.h"
-#include "croncpp.h"  // cron::cronexpr
 #include "facade/dragonfly_connection.h"
 #include "facade/reply_builder.h"
 #include "io/file_util.h"
 #include "io/proc_reader.h"
+#include "search/doc_index.h"
+#include "server/acl/acl_commands_def.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/debugcmd.h"
+#include "server/detail/save_stages_controller.h"
 #include "server/dflycmd.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
@@ -48,10 +54,8 @@ extern "C" {
 #include "server/version.h"
 #include "strings/human_readable.h"
 #include "util/accept_server.h"
-#include "util/cloud/aws.h"
-#include "util/cloud/s3.h"
+#include "util/aws/aws.h"
 #include "util/fibers/fiber_file.h"
-#include "util/uring/uring_file.h"
 
 using namespace std;
 
@@ -72,6 +76,8 @@ ABSL_FLAG(string, dbfilename, "dump-{timestamp}", "the filename to save/load the
 ABSL_FLAG(string, requirepass, "",
           "password for AUTH authentication. "
           "If empty can also be set with DFLY_PASSWORD environment variable.");
+ABSL_FLAG(uint32_t, maxclients, 64000, "Maximum number of concurrent clients allowed.");
+
 ABSL_FLAG(string, save_schedule, "",
           "glob spec for the UTC time to save a snapshot which matches HH:MM 24h time");
 ABSL_FLAG(string, snapshot_cron, "",
@@ -85,8 +91,23 @@ ABSL_FLAG(ReplicaOfFlag, replicaof, ReplicaOfFlag{},
           "Specifies a host and port which point to a target master "
           "to replicate. "
           "Format should be <IPv4>:<PORT> or host:<PORT> or [<IPv6>]:<PORT>");
+ABSL_FLAG(int32_t, slowlog_log_slower_than, 10000,
+          "Add commands slower than this threshold to slow log. The value is expressed in "
+          "microseconds and if it's negative - disables the slowlog.");
+ABSL_FLAG(uint32_t, slowlog_max_len, 20, "Slow log maximum length.");
 
-ABSL_DECLARE_FLAG(uint32_t, port);
+ABSL_FLAG(string, s3_endpoint, "", "endpoint for s3 snapshots, default uses aws regional endpoint");
+// Disable EC2 metadata by default, or if a users credentials are invalid the
+// AWS client will spent 30s trying to connect to inaccessable EC2 endpoints
+// to load the credentials.
+ABSL_FLAG(bool, s3_ec2_metadata, false,
+          "whether to load credentials and configuration from EC2 metadata");
+// Enables S3 payload signing over HTTP. This reduces the latency and resource
+// usage when writing snapshots to S3, at the expense of security.
+ABSL_FLAG(bool, s3_sign_payload, true,
+          "whether to sign the s3 request payload when uploading snapshots");
+
+ABSL_DECLARE_FLAG(int32_t, port);
 ABSL_DECLARE_FLAG(bool, cache_mode);
 ABSL_DECLARE_FLAG(uint32_t, hz);
 ABSL_DECLARE_FLAG(bool, tls);
@@ -126,10 +147,8 @@ bool AbslParseFlag(std::string_view in, ReplicaOfFlag* flag, std::string* err) {
     RETURN_ON_ERROR(ip.length() <= 2, "IPv6 host name is too short");
 
     flag->host = ip.substr(1, ip.length() - 2);
-    VLOG(1) << "received IP of type IPv6: " << flag->host;
   } else {
     flag->host = ip;
-    VLOG(1) << "received IP of type IPv4 (or a host): " << flag->host;
   }
 
   VLOG(1) << "--replicaof: Received " << flag->host << " :  " << flag->port;
@@ -141,6 +160,81 @@ std::string AbslUnparseFlag(const ReplicaOfFlag& flag) {
   return (flag.has_value()) ? absl::StrCat(flag.host, ":", flag.port) : "";
 }
 
+void SlowLogGet(dfly::CmdArgList args, dfly::ConnectionContext* cntx, dfly::Service& service,
+                std::string_view sub_cmd) {
+  size_t requested_slow_log_length = UINT32_MAX;
+  size_t argc = args.size();
+  if (argc >= 3) {
+    (*cntx)->SendError(facade::UnknownSubCmd(sub_cmd, "SLOWLOG"), facade::kSyntaxErrType);
+    return;
+  } else if (argc == 2) {
+    string_view length = facade::ArgS(args, 1);
+    int64_t num;
+    if ((!absl::SimpleAtoi(length, &num)) || (num < -1)) {
+      (*cntx)->SendError("count should be greater than or equal to -1");
+      return;
+    }
+    if (num >= 0) {
+      requested_slow_log_length = num;
+    }
+  }
+
+  // gather all the individual slowlogs from all the fibers and sort them by their timestamp
+  std::vector<boost::circular_buffer<dfly::SlowLogEntry>> entries(service.proactor_pool().size());
+  service.proactor_pool().AwaitFiberOnAll([&](auto index, auto* context) {
+    auto shard_entries = dfly::ServerState::tlocal()->GetSlowLog().Entries();
+    entries[index] = shard_entries;
+  });
+  std::vector<std::pair<dfly::SlowLogEntry, unsigned>> merged_slow_log;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    for (const auto& log_item : entries[i]) {
+      merged_slow_log.emplace_back(log_item, i);
+    }
+  }
+  std::sort(merged_slow_log.begin(), merged_slow_log.end(), [](const auto& e1, const auto& e2) {
+    return e1.first.unix_timestamp > e2.first.unix_timestamp;
+  });
+
+  requested_slow_log_length = std::min(merged_slow_log.size(), requested_slow_log_length);
+
+  (*cntx)->StartArray(requested_slow_log_length);
+  for (size_t i = 0; i < requested_slow_log_length; ++i) {
+    const auto& entry = merged_slow_log[i].first;
+    const auto& args = entry.cmd_args;
+
+    (*cntx)->StartArray(6);
+
+    (*cntx)->SendLong(entry.entry_id * service.proactor_pool().size() + merged_slow_log[i].second);
+    (*cntx)->SendLong(entry.unix_timestamp / 1000000000);
+    (*cntx)->SendLong(entry.execution_time_micro);
+
+    // if we truncated the args, there is one pseudo-element containing the number of truncated
+    // args that we must add, so the result length is increased by 1
+    size_t len = args.size() + int(args.size() < entry.original_length);
+
+    (*cntx)->StartArray(len);
+
+    for (const auto& arg : args) {
+      if (arg.second > 0) {
+        auto suffix = absl::StrCat("... (", arg.second, " more bytes)");
+        auto cmd_arg = arg.first.substr(0, dfly::kMaximumSlowlogArgLength - suffix.length());
+        (*cntx)->SendBulkString(absl::StrCat(cmd_arg, suffix));
+      } else {
+        (*cntx)->SendBulkString(arg.first);
+      }
+    }
+    // if we truncated arguments - add a special string to indicate that.
+    if (args.size() < entry.original_length) {
+      (*cntx)->SendBulkString(
+          absl::StrCat("... (", entry.original_length - args.size(), " more arguments)"));
+    }
+
+    (*cntx)->SendBulkString(entry.client_ip);
+    (*cntx)->SendBulkString(entry.client_name);
+  }
+  return;
+}
+
 namespace dfly {
 
 namespace fs = std::filesystem;
@@ -149,6 +243,7 @@ using absl::GetFlag;
 using absl::StrCat;
 using namespace facade;
 using namespace util;
+using detail::SaveStagesController;
 using http::StringResponse;
 using strings::HumanReadableNumBytes;
 
@@ -156,9 +251,6 @@ namespace {
 
 const auto kRedisVersion = "6.2.11";
 constexpr string_view kS3Prefix = "s3://"sv;
-
-const auto kRdbWriteFlags = O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC | O_DIRECT;
-const size_t kBucketConnectMs = 2000;
 
 using EngineFunc = void (ServerFamily::*)(CmdArgList args, ConnectionContext* cntx);
 
@@ -168,116 +260,13 @@ inline CommandId::Handler HandlerFunc(ServerFamily* se, EngineFunc f) {
 
 using CI = CommandId;
 
-// Create a direc
-error_code CreateDirs(fs::path dir_path) {
-  error_code ec;
-  fs::file_status dir_status = fs::status(dir_path, ec);
-  if (ec == errc::no_such_file_or_directory) {
-    fs::create_directories(dir_path, ec);
-    if (!ec)
-      dir_status = fs::status(dir_path, ec);
-  }
-  return ec;
-}
-
 string UnknownCmd(string cmd, CmdArgList args) {
   return absl::StrCat("unknown command '", cmd, "' with args beginning with: ",
                       StrJoin(args.begin(), args.end(), ", ", CmdArgListFormatter()));
 }
 
-void SubstituteFilenameTsPlaceholder(fs::path* filename, std::string_view replacement) {
-  *filename = absl::StrReplaceAll(filename->string(), {{"{timestamp}", replacement}});
-}
-
 bool IsCloudPath(string_view path) {
   return absl::StartsWith(path, kS3Prefix);
-}
-
-// Returns bucket_name, obj_path for an s3 path.
-optional<pair<string, string>> GetBucketPath(string_view path) {
-  string_view clean = absl::StripPrefix(path, kS3Prefix);
-
-  size_t pos = clean.find('/');
-  if (pos == string_view::npos)
-    return nullopt;
-
-  string bucket_name{clean.substr(0, pos)};
-  string obj_path{clean.substr(pos + 1)};
-  return make_pair(move(bucket_name), move(obj_path));
-}
-
-string InferLoadFile(string_view dir, cloud::AWS* aws) {
-  fs::path data_folder;
-  string bucket_name, obj_path;
-
-  if (dir.empty()) {
-    data_folder = fs::current_path();
-  } else {
-    if (IsCloudPath(dir)) {
-      CHECK(aws);
-      auto res = GetBucketPath(dir);
-      if (!res) {
-        LOG(ERROR) << "Invalid S3 path: " << dir;
-        return {};
-      }
-      data_folder = dir;
-      bucket_name = res->first;
-      obj_path = res->second;
-    } else {
-      error_code file_ec;
-      data_folder = fs::canonical(dir, file_ec);
-      if (file_ec) {
-        LOG(ERROR) << "Data directory error: " << file_ec.message() << " for dir " << dir;
-        return {};
-      }
-    }
-  }
-
-  LOG(INFO) << "Data directory is " << data_folder;
-
-  const auto& dbname = GetFlag(FLAGS_dbfilename);
-  if (dbname.empty())
-    return string{};
-
-  if (IsCloudPath(dir)) {
-    cloud::S3Bucket bucket(*aws, bucket_name);
-    ProactorBase* proactor = shard_set->pool()->GetNextProactor();
-    auto ec = proactor->Await([&] { return bucket.Connect(kBucketConnectMs); });
-    if (ec) {
-      LOG(ERROR) << "Couldn't connect to S3 bucket: " << ec.message();
-      return {};
-    }
-
-    fs::path fl_path{obj_path};
-    fl_path.append(dbname);
-
-    LOG(INFO) << "Loading from s3 path s3://" << bucket_name << "/" << fl_path;
-    // TODO: to load from S3 file.
-    return {};
-  }
-
-  fs::path fl_path = data_folder.append(dbname);
-  if (fs::exists(fl_path))
-    return fl_path.generic_string();
-
-  SubstituteFilenameTsPlaceholder(&fl_path, "*");
-  if (!fl_path.has_extension()) {
-    fl_path += "*";
-  }
-  io::Result<io::StatShortVec> short_vec = io::StatFiles(fl_path.generic_string());
-
-  if (short_vec) {
-    // io::StatFiles returns a list of sorted files. Because our timestamp format has the same
-    // time order and lexicographic order we iterate from the end to find the latest snapshot.
-    auto it = std::find_if(short_vec->rbegin(), short_vec->rend(), [](const auto& stat) {
-      return absl::EndsWith(stat.name, ".rdb") || absl::EndsWith(stat.name, "summary.dfs");
-    });
-    if (it != short_vec->rend())
-      return it->name;
-  } else {
-    LOG(WARNING) << "Could not stat " << fl_path << ", error " << short_vec.error().message();
-  }
-  return string{};
 }
 
 bool IsValidSaveScheduleNibble(string_view time, unsigned int max) {
@@ -303,193 +292,6 @@ bool IsValidSaveScheduleNibble(string_view time, unsigned int max) {
   }
 
   return min_match <= max;
-}
-
-// takes ownership over the file.
-class LinuxWriteWrapper : public io::Sink {
- public:
-  LinuxWriteWrapper(LinuxFile* lf) : lf_(lf) {
-  }
-
-  io::Result<size_t> WriteSome(const iovec* v, uint32_t len) final;
-
-  error_code Close() {
-    return lf_->Close();
-  }
-
- private:
-  unique_ptr<LinuxFile> lf_;
-  off_t offset_ = 0;
-};
-
-class RdbSnapshot {
- public:
-  RdbSnapshot(FiberQueueThreadPool* fq_tp) : fq_tp_(fq_tp) {
-  }
-
-  GenericError Start(SaveMode save_mode, const string& path, const StringVec& lua_scripts);
-  void StartInShard(EngineShard* shard);
-
-  error_code SaveBody();
-  error_code Close();
-
-  const RdbTypeFreqMap freq_map() const {
-    return freq_map_;
-  }
-
-  bool HasStarted() const {
-    return started_ || (saver_ && saver_->Mode() == SaveMode::SUMMARY);
-  }
-
-  // Sets a pointer to global aws object that provides an auth key.
-  // The ownership stays with the caller.
-  void SetAWS(cloud::AWS* aws) {
-    aws_ = aws;
-  }
-
- private:
-  bool started_ = false;
-  bool is_linux_file_ = false;
-  FiberQueueThreadPool* fq_tp_ = nullptr;
-  cloud::AWS* aws_ = nullptr;
-
-  unique_ptr<io::Sink> io_sink_;
-  unique_ptr<RdbSaver> saver_;
-  RdbTypeFreqMap freq_map_;
-
-  Cancellation cll_{};
-};
-
-io::Result<size_t> LinuxWriteWrapper::WriteSome(const iovec* v, uint32_t len) {
-  io::Result<size_t> res = lf_->WriteSome(v, len, offset_, 0);
-  if (res) {
-    offset_ += *res;
-  }
-
-  return res;
-}
-
-GenericError RdbSnapshot::Start(SaveMode save_mode, const std::string& path,
-                                const StringVec& lua_scripts) {
-  bool is_direct = false;
-  VLOG(1) << "Saving RDB " << path;
-
-  if (IsCloudPath(path)) {
-    DCHECK(aws_);
-
-    optional<pair<string, string>> bucket_path = GetBucketPath(path);
-    if (!bucket_path) {
-      return GenericError("Invalid S3 path");
-    }
-    auto [bucket_name, obj_path] = *bucket_path;
-
-    cloud::S3Bucket bucket(*aws_, bucket_name);
-    error_code ec = bucket.Connect(kBucketConnectMs);
-    if (ec) {
-      return GenericError(ec, "Couldn't connect to S3 bucket");
-    }
-    auto res = bucket.OpenWriteFile(obj_path);
-    if (!res) {
-      return GenericError(res.error(), "Couldn't open file for writing");
-    }
-    io_sink_.reset(*res);
-  } else {
-    if (fq_tp_) {  // EPOLL
-      auto res = util::OpenFiberWriteFile(path, fq_tp_);
-      if (!res)
-        return GenericError(res.error(), "Couldn't open file for writing");
-      io_sink_.reset(*res);
-    } else {
-      auto res = OpenLinux(path, kRdbWriteFlags, 0666);
-      if (!res) {
-        return GenericError(
-            res.error(),
-            "Couldn't open file for writing (is direct I/O supported by the file system?)");
-      }
-      is_linux_file_ = true;
-      io_sink_.reset(new LinuxWriteWrapper(res->release()));
-      is_direct = kRdbWriteFlags & O_DIRECT;
-    }
-  }
-
-  saver_.reset(new RdbSaver(io_sink_.get(), save_mode, is_direct));
-
-  return saver_->SaveHeader(lua_scripts);
-}
-
-error_code RdbSnapshot::SaveBody() {
-  return saver_->SaveBody(&cll_, &freq_map_);
-}
-
-error_code RdbSnapshot::Close() {
-  if (is_linux_file_) {
-    return static_cast<LinuxWriteWrapper*>(io_sink_.get())->Close();
-  }
-  return static_cast<io::WriteFile*>(io_sink_.get())->Close();
-}
-
-void RdbSnapshot::StartInShard(EngineShard* shard) {
-  saver_->StartSnapshotInShard(false, &cll_, shard);
-  started_ = true;
-}
-
-string FormatTs(absl::Time now) {
-  return absl::FormatTime("%Y-%m-%dT%H:%M:%S", now, absl::LocalTimeZone());
-}
-
-// modifies 'filename' to be "filename-postfix.extension"
-void SetExtension(absl::AlphaNum postfix, string_view extension, fs::path* filename) {
-  filename->replace_extension();  // clear if exists
-  *filename += StrCat("-", postfix, extension);
-}
-
-void ExtendDfsFilenameWithShard(int shard, string_view extension, fs::path* filename) {
-  // dragonfly snapshot.
-  SetExtension(absl::Dec(shard, absl::kZeroPad4), extension, filename);
-}
-
-GenericError ValidateFilename(const fs::path& filename, bool new_version) {
-  bool is_cloud_path = IsCloudPath(filename.string());
-
-  if (!filename.parent_path().empty() && !is_cloud_path) {
-    return {absl::StrCat("filename may not contain directory separators (Got \"", filename.c_str(),
-                         "\"). dbfilename should specify the filename without the directory")};
-  }
-
-  if (!filename.has_extension()) {
-    return {};
-  }
-
-  if (new_version) {
-    if (absl::EqualsIgnoreCase(filename.extension().c_str(), ".rdb")) {
-      return {absl::StrCat(
-          "DF snapshot format is used but '.rdb' extension was given. Use --nodf_snapshot_format "
-          "or remove the filename extension.")};
-    } else {
-      return {absl::StrCat("DF snapshot format requires no filename extension. Got \"",
-                           filename.extension().c_str(), "\"")};
-    }
-  }
-  if (!new_version && !absl::EqualsIgnoreCase(filename.extension().c_str(), ".rdb")) {
-    return {absl::StrCat("Bad filename extension \"", filename.extension().c_str(),
-                         "\" for SAVE with type RDB")};
-  }
-  return {};
-}
-
-void SlowLog(CmdArgList args, ConnectionContext* cntx) {
-  ToUpper(&args[0]);
-  string_view sub_cmd = ArgS(args, 0);
-
-  if (sub_cmd == "LEN") {
-    return (*cntx)->SendLong(0);
-  }
-
-  if (sub_cmd == "GET") {
-    return (*cntx)->SendEmptyArray();
-  }
-
-  (*cntx)->SendError(UnknownSubCmd(sub_cmd, "SLOWLOG"), kSyntaxErrType);
 }
 
 // Check that if TLS is used at least one form of client authentication is
@@ -520,6 +322,24 @@ void ValidateServerTlsFlags() {
 
 bool IsReplicatingNoOne(string_view host, string_view port) {
   return absl::EqualsIgnoreCase(host, "no") && absl::EqualsIgnoreCase(port, "one");
+}
+
+void RebuildAllSearchIndices(Service* service) {
+  const CommandId* cmd = service->FindCmd("FT.CREATE");
+  if (cmd == nullptr) {
+    // On MacOS we don't include search so FT.CREATE won't exist.
+    return;
+  }
+  boost::intrusive_ptr<Transaction> trans{new Transaction{cmd}};
+  trans->InitByArgs(0, {});
+  trans->ScheduleSingleHop([](auto* trans, auto* es) {
+    es->search_indices()->RebuildAllIndices(trans->GetOpArgs(es));
+    return OpStatus::OK;
+  });
+}
+
+template <typename T> void UpdateMax(T* maxv, T current) {
+  *maxv = std::max(*maxv, current);
 }
 
 }  // namespace
@@ -579,7 +399,7 @@ std::optional<cron::cronexpr> InferSnapshotCronExpr() {
 
   if (!snapshot_cron_exp.empty() && !save_time.empty()) {
     LOG(ERROR) << "snapshot_cron and save_schedule flags should not be set simultaneously";
-    quick_exit(1);
+    exit(1);
   }
 
   string raw_cron_expr;
@@ -619,7 +439,8 @@ ServerFamily::ServerFamily(Service* service) : service_(*service) {
     DCHECK_EQ(CONFIG_RUN_ID_SIZE, master_id_.size());
   }
 
-  if (auto ec = ValidateFilename(GetFlag(FLAGS_dbfilename), GetFlag(FLAGS_df_snapshot_format));
+  if (auto ec =
+          detail::ValidateFilename(GetFlag(FLAGS_dbfilename), GetFlag(FLAGS_df_snapshot_format));
       ec) {
     LOG(ERROR) << ec.Format();
     exit(1);
@@ -632,11 +453,53 @@ ServerFamily::ServerFamily(Service* service) : service_(*service) {
 ServerFamily::~ServerFamily() {
 }
 
+void SetMaxClients(std::vector<facade::Listener*>& listeners, uint32_t maxclients) {
+  for (auto* listener : listeners) {
+    if (!listener->IsPrivilegedInterface()) {
+      listener->SetMaxClients(maxclients);
+    }
+  }
+}
+
+void SetSlowLogMaxLen(util::ProactorPool& pool, uint32_t val) {
+  pool.AwaitFiberOnAll(
+      [&val](auto index, auto* context) { ServerState::tlocal()->GetSlowLog().ChangeLength(val); });
+}
+
+void SetSlowLogThreshold(util::ProactorPool& pool, int32_t val) {
+  pool.AwaitFiberOnAll(
+      [&val](auto index, auto* context) { ServerState::tlocal()->log_slower_than_usec = val; });
+}
+
 void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> listeners) {
   CHECK(acceptor_ == nullptr);
   acceptor_ = acceptor;
   listeners_ = std::move(listeners);
   dfly_cmd_ = make_unique<DflyCmd>(this);
+
+  SetMaxClients(listeners_, absl::GetFlag(FLAGS_maxclients));
+  config_registry.RegisterMutable("maxclients", [this](const absl::CommandLineFlag& flag) {
+    auto res = flag.TryGet<uint32_t>();
+    if (res.has_value())
+      SetMaxClients(listeners_, res.value());
+    return res.has_value();
+  });
+
+  SetSlowLogThreshold(service_.proactor_pool(), absl::GetFlag(FLAGS_slowlog_log_slower_than));
+  config_registry.RegisterMutable("slowlog_log_slower_than",
+                                  [this](const absl::CommandLineFlag& flag) {
+                                    auto res = flag.TryGet<int32_t>();
+                                    if (res.has_value())
+                                      SetSlowLogThreshold(service_.proactor_pool(), res.value());
+                                    return res.has_value();
+                                  });
+  SetSlowLogMaxLen(service_.proactor_pool(), absl::GetFlag(FLAGS_slowlog_max_len));
+  config_registry.RegisterMutable("slowlog_max_len", [this](const absl::CommandLineFlag& flag) {
+    auto res = flag.TryGet<uint32_t>();
+    if (res.has_value())
+      SetSlowLogMaxLen(service_.proactor_pool(), res.value());
+    return res.has_value();
+  });
 
   pb_task_ = shard_set->pool()->GetNextProactor();
   if (pb_task_->GetKind() == ProactorBase::EPOLL) {
@@ -660,8 +523,21 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
 
   uint32_t cache_hz = max(GetFlag(FLAGS_hz) / 10, 1u);
   uint32_t period_ms = max(1u, 1000 / cache_hz);
+
   stats_caching_task_ =
       pb_task_->AwaitBrief([&] { return pb_task_->AddPeriodic(period_ms, cache_cb); });
+
+  string flag_dir = GetFlag(FLAGS_dir);
+  if (IsCloudPath(flag_dir)) {
+    shard_set->pool()->GetNextProactor()->Await([&] { util::aws::Init(); });
+    snapshot_storage_ = std::make_shared<detail::AwsS3SnapshotStorage>(
+        absl::GetFlag(FLAGS_s3_endpoint), absl::GetFlag(FLAGS_s3_ec2_metadata),
+        absl::GetFlag(FLAGS_s3_sign_payload));
+  } else if (fq_threadpool_) {
+    snapshot_storage_ = std::make_shared<detail::FileSnapshotStorage>(fq_threadpool_.get());
+  } else {
+    snapshot_storage_ = std::make_shared<detail::FileSnapshotStorage>(nullptr);
+  }
 
   // check for '--replicaof' before loading anything
   if (ReplicaOfFlag flag = GetFlag(FLAGS_replicaof); flag.has_value()) {
@@ -670,17 +546,18 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
     return;  // DONT load any snapshots
   }
 
-  string flag_dir = GetFlag(FLAGS_dir);
-  if (IsCloudPath(flag_dir)) {
-    aws_ = make_unique<cloud::AWS>("s3");
-    if (auto ec = aws_->Init(); ec) {
-      LOG(FATAL) << "Failed to initialize AWS " << ec;
+  const auto load_path_result = snapshot_storage_->LoadPath(flag_dir, GetFlag(FLAGS_dbfilename));
+  if (load_path_result) {
+    const std::string load_path = *load_path_result;
+    if (!load_path.empty()) {
+      load_result_ = Load(load_path);
     }
-  }
-
-  string load_path = InferLoadFile(flag_dir, aws_.get());
-  if (!load_path.empty()) {
-    load_result_ = Load(load_path);
+  } else {
+    if (std::error_code(load_path_result.error()) == std::errc::no_such_file_or_directory) {
+      LOG(WARNING) << "Load snapshot: No snapshot found";
+    } else {
+      LOG(ERROR) << "Failed to load snapshot: " << load_path_result.error().Format();
+    }
   }
 
   snapshot_schedule_fb_ =
@@ -708,8 +585,10 @@ void ServerFamily::Shutdown() {
   }
 
   pb_task_->Await([this] {
-    pb_task_->CancelPeriodic(stats_caching_task_);
-    stats_caching_task_ = 0;
+    if (stats_caching_task_) {
+      pb_task_->CancelPeriodic(stats_caching_task_);
+      stats_caching_task_ = 0;
+    }
 
     if (journal_->EnterLameDuck()) {
       auto ec = journal_->Close();
@@ -733,43 +612,17 @@ struct AggregateLoadResult {
 // Load starts as many fibers as there are files to load each one separately.
 // It starts one more fiber that waits for all load fibers to finish and returns the first
 // error (if any occured) with a future.
-Future<std::error_code> ServerFamily::Load(const std::string& load_path) {
-  if (!(absl::EndsWith(load_path, ".rdb") || absl::EndsWith(load_path, "summary.dfs"))) {
-    LOG(ERROR) << "Bad filename extension \"" << load_path << "\"";
-    Promise<std::error_code> ec_promise;
-    ec_promise.set_value(make_error_code(errc::invalid_argument));
+Future<GenericError> ServerFamily::Load(const std::string& load_path) {
+  auto paths_result = snapshot_storage_->LoadPaths(load_path);
+  if (!paths_result) {
+    LOG(ERROR) << "Failed to load snapshot: " << paths_result.error().Format();
+
+    Promise<GenericError> ec_promise;
+    ec_promise.set_value(paths_result.error());
     return ec_promise.get_future();
   }
 
-  vector<std::string> paths{{load_path}};
-
-  // Collect all other files in case we're loading dfs.
-  if (absl::EndsWith(load_path, "summary.dfs")) {
-    std::string glob = absl::StrReplaceAll(load_path, {{"summary", "????"}});
-    io::Result<io::StatShortVec> files = io::StatFiles(glob);
-
-    if (files && files->size() == 0) {
-      Promise<std::error_code> ec_promise;
-      ec_promise.set_value(make_error_code(errc::no_such_file_or_directory));
-      return ec_promise.get_future();
-    }
-
-    for (auto& fstat : *files) {
-      paths.push_back(std::move(fstat.name));
-    }
-  }
-
-  // Check all paths are valid.
-  for (const auto& path : paths) {
-    error_code ec;
-    (void)fs::canonical(path, ec);
-    if (ec) {
-      LOG(ERROR) << "Error loading " << load_path << " " << ec.message();
-      Promise<std::error_code> ec_promise;
-      ec_promise.set_value(ec);
-      return ec_promise.get_future();
-    }
-  }
+  std::vector<std::string> paths = *paths_result;
 
   LOG(INFO) << "Loading " << load_path;
 
@@ -806,8 +659,8 @@ Future<std::error_code> ServerFamily::Load(const std::string& load_path) {
     load_fibers.push_back(proactor->LaunchFiber(std::move(load_fiber)));
   }
 
-  Promise<std::error_code> ec_promise;
-  Future<std::error_code> ec_future = ec_promise.get_future();
+  Promise<GenericError> ec_promise;
+  Future<GenericError> ec_future = ec_promise.get_future();
 
   // Run fiber that empties the channel and sets ec_promise.
   auto load_join_fiber = [this, aggregated_result, load_fibers = std::move(load_fibers),
@@ -815,7 +668,11 @@ Future<std::error_code> ServerFamily::Load(const std::string& load_path) {
     for (auto& fiber : load_fibers) {
       fiber.Join();
     }
-
+    if (aggregated_result->first_error) {
+      LOG(ERROR) << "Rdb load failed. " << (*aggregated_result->first_error).message();
+      exit(1);
+    }
+    RebuildAllSearchIndices(&service_);
     LOG(INFO) << "Load finished, num keys read: " << aggregated_result->keys_read;
     service_.SwitchState(GlobalState::LOADING, GlobalState::ACTIVE);
     ec_promise.set_value(*(aggregated_result->first_error));
@@ -853,14 +710,7 @@ void ServerFamily::SnapshotScheduling() {
 
 io::Result<size_t> ServerFamily::LoadRdb(const std::string& rdb_file) {
   error_code ec;
-  io::ReadonlyFileOrError res;
-
-  if (fq_threadpool_) {
-    res = util::OpenFiberReadFile(rdb_file, fq_threadpool_.get());
-  } else {
-    res = OpenRead(rdb_file);
-  }
-
+  io::ReadonlyFileOrError res = snapshot_storage_->OpenReadFile(rdb_file);
   if (res) {
     io::FileSource fs(*res);
 
@@ -940,6 +790,8 @@ void PrintPrometheusMetrics(const Metrics& m, StringResponse* resp) {
   AppendMetricValue("version", 1, {"version"}, {GetVersion()}, &resp->body());
   AppendMetricHeader("role", "", MetricType::GAUGE, &resp->body());
   AppendMetricValue("role", 1, {"role"}, {m.is_master ? "master" : "replica"}, &resp->body());
+  AppendMetricWithoutLabels("master", "1 if master 0 if replica", m.is_master ? 1 : 0,
+                            MetricType::GAUGE, &resp->body());
   AppendMetricWithoutLabels("uptime_in_seconds", "", m.uptime, MetricType::GAUGE, &resp->body());
 
   // Clients metrics
@@ -961,8 +813,8 @@ void PrintPrometheusMetrics(const Metrics& m, StringResponse* resp) {
   AppendMetricWithoutLabels("memory_max_bytes", "", max_memory_limit, MetricType::GAUGE,
                             &resp->body());
   if (sdata_res.has_value()) {
-    AppendMetricWithoutLabels("used_memory_rss_bytes", "", sdata_res->vm_rss, MetricType::GAUGE,
-                              &resp->body());
+    size_t rss = sdata_res->vm_rss + sdata_res->hugetlb_pages;
+    AppendMetricWithoutLabels("used_memory_rss_bytes", "", rss, MetricType::GAUGE, &resp->body());
   } else {
     LOG_FIRST_N(ERROR, 10) << "Error fetching /proc/self/status stats. error "
                            << sdata_res.error().message();
@@ -998,9 +850,10 @@ void PrintPrometheusMetrics(const Metrics& m, StringResponse* resp) {
   AppendMetricHeader("db_keys_expiring", "Total number of expiring keys by DB", MetricType::GAUGE,
                      &db_key_expire_metrics);
 
-  for (size_t i = 0; i < m.db.size(); ++i) {
-    AppendMetricValue("db_keys", m.db[i].key_count, {"db"}, {StrCat("db", i)}, &db_key_metrics);
-    AppendMetricValue("db_keys_expiring", m.db[i].expire_count, {"db"}, {StrCat("db", i)},
+  for (size_t i = 0; i < m.db_stats.size(); ++i) {
+    AppendMetricValue("db_keys", m.db_stats[i].key_count, {"db"}, {StrCat("db", i)},
+                      &db_key_metrics);
+    AppendMetricValue("db_keys_expiring", m.db_stats[i].expire_count, {"db"}, {StrCat("db", i)},
                       &db_key_expire_metrics);
   }
 
@@ -1142,38 +995,6 @@ void ServerFamily::StatsMC(std::string_view section, facade::ConnectionContext* 
 #undef ADD_LINE
 }
 
-// Run callback for all active RdbSnapshots (passed as index).
-// .dfs format contains always `shard_set->size() + 1` snapshots (for every shard and summary
-// file).
-static void RunStage(
-    bool new_version, std::function<void(unsigned)> cb,
-    std::function<void(EngineShard*)> maybe_reset_events = []([[maybe_unused]] auto*) {}) {
-  if (new_version) {
-    shard_set->RunBlockingInParallel([&](EngineShard* es) {
-      cb(es->shard_id());
-      maybe_reset_events(es);
-    });
-    cb(shard_set->size());
-  } else {
-    cb(0);
-  }
-};
-
-// Start saving a single snapshot of a multi-file dfly snapshot.
-// If shard is null, then this is the summary file.
-GenericError DoPartialSave(const fs::path& full_filename, const dfly::StringVec& scripts,
-                           RdbSnapshot* snapshot, EngineShard* shard) {
-  // Start rdb saving.
-  SaveMode mode = shard == nullptr ? SaveMode::SUMMARY : SaveMode::SINGLE_SHARD;
-  GenericError local_ec = snapshot->Start(mode, full_filename.string(), scripts);
-
-  if (!local_ec && mode == SaveMode::SINGLE_SHARD) {
-    snapshot->StartInShard(shard);
-  }
-
-  return local_ec;
-}
-
 GenericError ServerFamily::DoSave() {
   const CommandId* cid = service().FindCmd("SAVE");
   CHECK_NOTNULL(cid);
@@ -1183,217 +1004,10 @@ GenericError ServerFamily::DoSave() {
 }
 
 GenericError ServerFamily::DoSave(bool new_version, string_view basename, Transaction* trans) {
-  fs::path dir_path(GetFlag(FLAGS_dir));
-  AggregateGenericError ec;
-
-  // Check directory.
-  if (!dir_path.empty()) {
-    if (auto local_ec = CreateDirs(dir_path); local_ec) {
-      return {local_ec, "create-dir"};
-    }
-  }
-
-  // Manage global state.
-  GlobalState new_state = service_.SwitchState(GlobalState::ACTIVE, GlobalState::SAVING);
-  if (new_state != GlobalState::SAVING && new_state != GlobalState::TAKEN_OVER) {
-    return {make_error_code(errc::operation_in_progress),
-            StrCat(GlobalStateName(new_state), " - can not save database")};
-  }
-  absl::Cleanup rev_state = [this, new_state] {
-    if (new_state == GlobalState::SAVING)
-      service_.SwitchState(GlobalState::SAVING, GlobalState::ACTIVE);
-  };
-
-  absl::Time start = absl::Now();
-
-  fs::path filename;
-
-  if (basename.empty())
-    filename = GetFlag(FLAGS_dbfilename);
-  else
-    filename = basename;
-
-  if (auto ec = ValidateFilename(filename, new_version); ec) {
-    return ec;
-  }
-  SubstituteFilenameTsPlaceholder(&filename, FormatTs(start));
-  fs::path fpath = dir_path;
-
-  shared_ptr<LastSaveInfo> save_info;
-
-  vector<pair<unique_ptr<RdbSnapshot>, fs::path>> snapshots;
-  absl::flat_hash_map<string_view, size_t> rdb_name_map;
-  Mutex mu;  // guards rdb_name_map
-
-  auto save_cb = [&](unsigned index) {
-    auto& snapshot = snapshots[index].first;
-    if (snapshot && snapshot->HasStarted()) {
-      ec = snapshot->SaveBody();
-    }
-  };
-
-  auto close_cb = [&](unsigned index) {
-    auto& snapshot = snapshots[index].first;
-    if (snapshot) {
-      ec = snapshot->Close();
-
-      lock_guard lk(mu);
-      for (const auto& k_v : snapshot->freq_map()) {
-        rdb_name_map[RdbTypeName(k_v.first)] += k_v.second;
-      }
-    }
-  };
-
-  auto get_scripts = [this] {
-    auto scripts = script_mgr_->GetAll();
-    StringVec script_bodies;
-    for (auto& [sha, data] : scripts) {
-      script_bodies.push_back(move(data.body));
-    }
-    return script_bodies;
-  };
-
-  fpath /= filename;
-
-  const bool is_cloud = IsCloudPath(fpath.string());
-
-  if (is_cloud) {
-    if (!aws_) {
-      aws_ = make_unique<cloud::AWS>("s3");
-      if (auto ec = aws_->Init(); ec) {
-        LOG(ERROR) << "Failed to initialize AWS " << ec;
-        aws_.reset();
-        return GenericError(ec, "Couldn't initialize AWS");
-      }
-    }
-  }
-
-  // Start snapshots.
-  if (new_version) {
-    // In the new version (.dfs) we store a file for every shard and one more summary file.
-    // Summary file is always last in snapshots array.
-    const size_t sz = shard_set->size();
-    constexpr string_view ext = ".dfs.tmp"sv;
-    snapshots.resize(sz + 1);
-
-    // Set file names for shards
-    for (auto sid = 0u; sid < sz; ++sid) {
-      auto& filename = snapshots[sid].second;
-      filename = fpath;                                 // starts with fpath
-      ExtendDfsFilenameWithShard(sid, ext, &filename);  // later append -<shard id>.dfs.tmp
-    }
-
-    // Set summary file name
-    snapshots.back().second = fpath;
-    SetExtension("summary", ext, &snapshots.back().second);
-
-    // Save summary file.
-    {
-      auto scripts = get_scripts();
-      auto& [snapshot, filename] = snapshots[sz];
-      snapshot.reset(new RdbSnapshot(fq_threadpool_.get()));
-
-      snapshot->SetAWS(aws_.get());
-      if (auto local_ec = DoPartialSave(filename, scripts, snapshot.get(), nullptr); local_ec) {
-        ec = local_ec;
-        snapshot.reset();
-      }
-    }
-
-    // Save shard files.
-    auto cb = [&](Transaction* t, EngineShard* shard) {
-      auto& [snapshot, filename] = snapshots[shard->shard_id()];
-      snapshot.reset(new RdbSnapshot(fq_threadpool_.get()));
-      snapshot->SetAWS(aws_.get());
-      if (auto local_ec = DoPartialSave(filename, {}, snapshot.get(), shard); local_ec) {
-        ec = local_ec;
-        snapshot.reset();
-      }
-      return OpStatus::OK;
-    };
-
-    trans->ScheduleSingleHop(std::move(cb));
-  } else {
-    snapshots.resize(1);
-    auto& [snapshot, filename] = snapshots[0];
-
-    if (!fpath.has_extension()) {
-      fpath += ".rdb";
-    }
-
-    // begin by saving as temp, and later rename to the actual target
-    fpath += ".tmp";
-
-    filename = fpath;
-
-    snapshot.reset(new RdbSnapshot(fq_threadpool_.get()));
-    auto lua_scripts = get_scripts();
-
-    snapshot->SetAWS(aws_.get());
-    ec = snapshot->Start(SaveMode::RDB, filename,
-                         lua_scripts);  // filename == fpath, for consistency use filename
-
-    if (!ec) {
-      auto cb = [&](Transaction* t, EngineShard* shard) {
-        snapshot->StartInShard(shard);
-        return OpStatus::OK;
-      };
-
-      trans->ScheduleSingleHop(std::move(cb));
-    } else {
-      snapshot.reset();
-    }
-  }
-
-  is_saving_.store(true, memory_order_relaxed);
-
-  // Perform snapshot serialization, block the current fiber until it completes.
-  // TODO: Add cancellation in case of error.
-  RunStage(new_version, save_cb);
-
-  is_saving_.store(false, memory_order_relaxed);
-
-  auto reset_event_cb = [](EngineShard* es) { es->db_slice().ResetUpdateEvents(); };
-
-  RunStage(new_version, close_cb, reset_event_cb);
-
-  if (new_version) {
-    SetExtension("summary", ".dfs", &fpath);
-  } else
-    fpath.replace_extension();  // remove .tmp
-
-  absl::Duration dur = absl::Now() - start;
-  double seconds = double(absl::ToInt64Milliseconds(dur)) / 1000;
-
-  // Populate LastSaveInfo.
-  if (!ec) {
-    LOG(INFO) << "Saving " << fpath << " finished after "
-              << strings::HumanReadableElapsedTime(seconds);
-
-    if (!is_cloud)
-      for (const auto& [_, filename] : snapshots) {
-        auto copy = filename;
-        copy.replace_extension();
-
-        VLOG(1) << "snapshotting: rename " << filename.string() << " -> " << copy.string();
-        filesystem::rename(filename, copy);
-      }
-
-    save_info = make_shared<LastSaveInfo>();
-    for (const auto& k_v : rdb_name_map) {
-      save_info->freq_map.emplace_back(k_v);
-    }
-
-    save_info->save_time = absl::ToUnixSeconds(start);
-    save_info->file_name = fpath.generic_string();
-    save_info->duration_sec = uint32_t(seconds);
-
-    lock_guard lk(save_mu_);
-    // swap - to deallocate the old version outstide of the lock.
-    last_save_info_.swap(save_info);
-  }
-
-  return *ec;
+  SaveStagesController sc{detail::SaveStagesInputs{new_version, basename, trans, &service_,
+                                                   &is_saving_, fq_threadpool_.get(),
+                                                   &last_save_info_, &save_mu_, snapshot_storage_}};
+  return sc.Save();
 }
 
 error_code ServerFamily::Drakarys(Transaction* transaction, DbIndex db_ind) {
@@ -1496,14 +1110,32 @@ void ServerFamily::Auth(CmdArgList args, ConnectionContext* cntx) {
     return (*cntx)->SendError(kSyntaxErr);
   }
 
-  if (args.size() == 3) {
-    return (*cntx)->SendError("ACL is not supported yet");
+  // non admin port auth
+  if (!cntx->conn()->IsPrivileged()) {
+    const auto* registry = ServerState::tlocal()->user_registry;
+    const bool one_arg = args.size() == 1;
+    std::string_view username = one_arg ? "default" : facade::ToSV(args[0]);
+    const size_t index = one_arg ? 0 : 1;
+    std::string_view password = facade::ToSV(args[index]);
+    auto is_authorized = registry->AuthUser(username, password);
+    if (is_authorized) {
+      cntx->authed_username = username;
+      auto cred = registry->GetCredentials(username);
+      cntx->acl_categories = cred.acl_categories;
+      cntx->acl_commands = cred.acl_commands;
+      cntx->authenticated = true;
+      return (*cntx)->SendOk();
+    }
+    auto& log = ServerState::tlocal()->acl_log;
+    using Reason = acl::AclLog::Reason;
+    log.Add(*cntx, "AUTH", Reason::AUTH, std::string(username));
+    return (*cntx)->SendError(facade::kAuthRejected);
   }
 
   if (!cntx->req_auth) {
     return (*cntx)->SendError(
-        "AUTH <password> called without any password configured for the "
-        "default user. Are you sure your configuration is correct?");
+        "AUTH <password> called without any password configured for "
+        "admin port. Are you sure your configuration is correct?");
   }
 
   string_view pass = ArgS(args, 0);
@@ -1520,12 +1152,12 @@ void ServerFamily::Client(CmdArgList args, ConnectionContext* cntx) {
   string_view sub_cmd = ArgS(args, 0);
 
   if (sub_cmd == "SETNAME" && args.size() == 2) {
-    cntx->owner()->SetName(string{ArgS(args, 1)});
+    cntx->conn()->SetName(string{ArgS(args, 1)});
     return (*cntx)->SendOk();
   }
 
   if (sub_cmd == "GETNAME") {
-    auto name = cntx->owner()->GetName();
+    auto name = cntx->conn()->GetName();
     if (!name.empty()) {
       return (*cntx)->SendBulkString(name);
     } else {
@@ -1569,35 +1201,59 @@ void ServerFamily::Config(CmdArgList args, ConnectionContext* cntx) {
     }
 
     ToLower(&args[1]);
-    string_view config_name = ArgS(args, 1);
-    bool success = config_registry.Set(config_name, ArgS(args, 2));
-    if (success) {
-      return (*cntx)->SendOk();
-    } else {
-      return (*cntx)->SendError(ConfigSetFailed(config_name), kSyntaxErrType);
-    }
-  } else if (sub_cmd == "GET" && args.size() == 2) {
-    // Send empty response, like Redis does, unless the param is supported
-    std::vector<std::string> res;
-
     string_view param = ArgS(args, 1);
+
+    ConfigRegistry::SetResult result = config_registry.Set(param, ArgS(args, 2));
+
+    const char kErrPrefix[] = "CONFIG SET failed (possibly related to argument '";
+    switch (result) {
+      case ConfigRegistry::SetResult::OK:
+        return (*cntx)->SendOk();
+      case ConfigRegistry::SetResult::UNKNOWN:
+        return (*cntx)->SendError(
+            absl::StrCat("Unknown option or number of arguments for CONFIG SET - '", param, "'"),
+            kConfigErrType);
+
+      case ConfigRegistry::SetResult::READONLY:
+        return (*cntx)->SendError(
+            absl::StrCat(kErrPrefix, param, "') - can't set immutable config"), kConfigErrType);
+
+      case ConfigRegistry::SetResult::INVALID:
+        return (*cntx)->SendError(absl::StrCat(kErrPrefix, param, "') - argument can not be set"),
+                                  kConfigErrType);
+    }
+    ABSL_UNREACHABLE();
+  }
+
+  if (sub_cmd == "GET" && args.size() == 2) {
+    vector<string> res;
+    string_view param = ArgS(args, 1);
+
+    // Support 'databases' for backward compatibility.
     if (param == "databases") {
       res.emplace_back(param);
       res.push_back(absl::StrCat(absl::GetFlag(FLAGS_dbnum)));
-    } else if (param == "maxmemory") {
-      res.emplace_back(param);
-      res.push_back(absl::StrCat(max_memory_limit));
+    } else {
+      vector<string> names = config_registry.List(param);
+
+      for (const auto& name : names) {
+        absl::CommandLineFlag* flag = CHECK_NOTNULL(absl::FindCommandLineFlag(name));
+        res.push_back(name);
+        res.push_back(flag->CurrentValue());
+      }
     }
 
     return (*cntx)->SendStringArr(res, RedisReplyBuilder::MAP);
-  } else if (sub_cmd == "RESETSTAT") {
+  }
+
+  if (sub_cmd == "RESETSTAT") {
     shard_set->pool()->Await([registry = service_.mutable_registry()](unsigned index, auto*) {
       registry->ResetCallStats(index);
       auto& sstate = *ServerState::tlocal();
       auto& stats = sstate.connection_stats;
       stats.err_count_map.clear();
       stats.command_cnt = 0;
-      stats.async_writes_cnt = 0;
+      stats.pipelined_cmd_cnt = 0;
     });
 
     return (*cntx)->SendOk();
@@ -1654,12 +1310,12 @@ void ServerFamily::Save(CmdArgList args, ConnectionContext* cntx) {
   }
 }
 
-static void MergeInto(const DbSlice::Stats& src, Metrics* dest) {
-  if (src.db_stats.size() > dest->db.size())
-    dest->db.resize(src.db_stats.size());
-  for (size_t i = 0; i < src.db_stats.size(); ++i) {
-    dest->db[i] += src.db_stats[i];
-  }
+static void MergeDbSliceStats(const DbSlice::Stats& src, Metrics* dest) {
+  if (src.db_stats.size() > dest->db_stats.size())
+    dest->db_stats.resize(src.db_stats.size());
+
+  for (size_t i = 0; i < src.db_stats.size(); ++i)
+    dest->db_stats[i] += src.db_stats[i];
 
   dest->events += src.events;
   dest->small_string_bytes += src.small_string_bytes;
@@ -1667,8 +1323,13 @@ static void MergeInto(const DbSlice::Stats& src, Metrics* dest) {
 
 Metrics ServerFamily::GetMetrics() const {
   Metrics result;
-
   Mutex mu;
+
+  auto cmd_stat_cb = [&dest = result.cmd_stats_map](string_view name, const CmdCallStats& stat) {
+    auto& [calls, sum] = dest[string{name}];
+    calls += stat.first;
+    sum += stat.second;
+  };
 
   auto cb = [&](unsigned index, ProactorBase* pb) {
     EngineShard* shard = EngineShard::tlocal();
@@ -1676,41 +1337,46 @@ Metrics ServerFamily::GetMetrics() const {
 
     lock_guard lk(mu);
 
-    result.uptime = time(NULL) - this->start_time_;
+    result.coordinator_stats += ss->stats;
     result.conn_stats += ss->connection_stats;
-    result.qps += uint64_t(ss->MovingSum6());
-    result.ooo_tx_transaction_cnt += ss->stats.ooo_tx_cnt;
 
-    service_.mutable_registry()->MergeCallStats(
-        index, [&dest_map = result.cmd_stats_map](string_view name, const CmdCallStats& src) {
-          auto& ent = dest_map[string{name}];
-          ent.first += src.first;
-          ent.second += src.second;
-        });
+    result.uptime = time(NULL) - this->start_time_;
+    result.qps += uint64_t(ss->MovingSum6());
 
     if (shard) {
-      MergeInto(shard->db_slice().GetStats(), &result);
-
       result.heap_used_bytes += shard->UsedMemory();
-      if (shard->tiered_storage()) {
-        result.tiered_stats += shard->tiered_storage()->GetStats();
-      }
+      MergeDbSliceStats(shard->db_slice().GetStats(), &result);
       result.shard_stats += shard->stats();
+
+      if (shard->tiered_storage())
+        result.tiered_stats += shard->tiered_storage()->GetStats();
+      if (shard->search_indices())
+        result.search_stats += shard->search_indices()->GetStats();
+
       result.traverse_ttl_per_sec += shard->GetMovingSum6(EngineShard::TTL_TRAVERSE);
       result.delete_ttl_per_sec += shard->GetMovingSum6(EngineShard::TTL_DELETE);
     }
+
+    service_.mutable_registry()->MergeCallStats(index, cmd_stat_cb);
   };
 
   service_.proactor_pool().AwaitFiberOnAll(std::move(cb));
-  result.qps /= 6;  // normalize moving average stats
+
+  // Normalize moving average stats
+  result.qps /= 6;
   result.traverse_ttl_per_sec /= 6;
   result.delete_ttl_per_sec /= 6;
 
-  result.is_master = false;
-  if (ServerState::tlocal() && ServerState::tlocal()->is_master) {
-    result.is_master = true;
+  result.is_master = ServerState::tlocal() && ServerState::tlocal()->is_master;
+  if (result.is_master)
     result.replication_metrics = dfly_cmd_->GetReplicasRoleInfo();
-  }
+
+  // Update peak stats
+  lock_guard lk{peak_stats_mu_};
+  UpdateMax(&peak_stats_.conn_dispatch_queue_bytes, result.conn_stats.dispatch_queue_bytes);
+  UpdateMax(&peak_stats_.conn_read_buf_capacity, result.conn_stats.read_buf_capacity);
+
+  result.peak_stats = peak_stats_;
 
   return result;
 }
@@ -1730,25 +1396,26 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
   string info;
 
   auto should_enter = [&](string_view name, bool hidden = false) {
-    bool res = (!hidden && section.empty()) || section == "ALL" || section == name;
-    if (res && !info.empty())
-      info.append("\r\n");
-
-    return res;
+    if ((!hidden && section.empty()) || section == "ALL" || section == name) {
+      auto normalized_name = string{name.substr(0, 1)} + absl::AsciiStrToLower(name.substr(1));
+      absl::StrAppend(&info, info.empty() ? "" : "\r\n", "# ", normalized_name, "\r\n");
+      return true;
+    }
+    return false;
   };
 
   auto append = [&info](absl::AlphaNum a1, absl::AlphaNum a2) {
     absl::StrAppend(&info, a1, ":", a2, "\r\n");
   };
 
-#define ADD_HEADER(x) absl::StrAppend(&info, x "\r\n")
   Metrics m = GetMetrics();
+  DbStats total;
+  for (const auto& db_stats : m.db_stats)
+    total += db_stats;
 
   if (should_enter("SERVER")) {
     auto kind = ProactorBase::me()->GetKind();
     const char* multiplex_api = (kind == ProactorBase::IOURING) ? "iouring" : "epoll";
-
-    ADD_HEADER("# Server");
 
     append("redis_version", kRedisVersion);
     append("dragonfly_version", GetVersion());
@@ -1762,36 +1429,33 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
     append("uptime_in_days", uptime / (3600 * 24));
   }
 
-  auto sdata_res = io::ReadStatusInfo();
-
-  DbStats total;
-  for (const auto& db_stats : m.db) {
-    total += db_stats;
-  }
-
   if (should_enter("CLIENTS")) {
-    ADD_HEADER("# Clients");
     append("connected_clients", m.conn_stats.num_conns);
     append("client_read_buffer_bytes", m.conn_stats.read_buf_capacity);
     append("blocked_clients", m.conn_stats.num_blocked_clients);
+    append("dispatch_queue_entries", m.conn_stats.dispatch_queue_entries);
   }
 
   if (should_enter("MEMORY")) {
-    ADD_HEADER("# Memory");
+    io::Result<io::StatusData> sdata_res = io::ReadStatusInfo();
 
     append("used_memory", m.heap_used_bytes);
     append("used_memory_human", HumanReadableNumBytes(m.heap_used_bytes));
     append("used_memory_peak", used_mem_peak.load(memory_order_relaxed));
 
-    append("comitted_memory", GetMallocCurrentCommitted());
-
     if (sdata_res.has_value()) {
-      append("used_memory_rss", sdata_res->vm_rss);
-      append("used_memory_rss_human", HumanReadableNumBytes(sdata_res->vm_rss));
+      size_t rss = sdata_res->vm_rss + sdata_res->hugetlb_pages;
+      append("used_memory_rss", rss);
+      append("used_memory_rss_human", HumanReadableNumBytes(rss));
     } else {
       LOG_FIRST_N(ERROR, 10) << "Error fetching /proc/self/status stats. error "
                              << sdata_res.error().message();
     }
+
+    append("comitted_memory", GetMallocCurrentCommitted());
+
+    append("maxmemory", max_memory_limit);
+    append("maxmemory_human", HumanReadableNumBytes(max_memory_limit));
 
     // Blob - all these cases where the key/objects are represented by a single blob allocated on
     // heap. For example, strings or intsets. members of lists, sets, zsets etc
@@ -1807,21 +1471,31 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
     append("listpack_blobs", total.listpack_blob_cnt);
     append("listpack_bytes", total.listpack_bytes);
     append("small_string_bytes", m.small_string_bytes);
-    append("pipeline_cache_bytes", m.conn_stats.pipeline_cache_capacity);
-    append("maxmemory", max_memory_limit);
-    append("maxmemory_human", HumanReadableNumBytes(max_memory_limit));
+
+    append("pipeline_cache_bytes", m.conn_stats.pipeline_cmd_cache_bytes);
+    append("dispatch_queue_bytes", m.conn_stats.dispatch_queue_bytes);
+    append("dispatch_queue_peak_bytes", m.peak_stats.conn_dispatch_queue_bytes);
+    append("client_read_buffer_peak_bytes", m.peak_stats.conn_read_buf_capacity);
+
     if (GetFlag(FLAGS_cache_mode)) {
       append("cache_mode", "cache");
+      // PHP Symphony needs this field to work.
+      append("maxmemory_policy", "eviction");
     } else {
       append("cache_mode", "store");
       // Compatible with redis based frameworks.
       append("maxmemory_policy", "noeviction");
     }
+
+    if (m.is_master && !m.replication_metrics.empty()) {
+      ReplicationMemoryStats repl_mem;
+      dfly_cmd_->GetReplicationMemoryStats(&repl_mem);
+      append("replication_streaming_buffer_bytes", repl_mem.streamer_buf_capacity_bytes_);
+      append("replication_full_sync_buffer_bytes", repl_mem.full_sync_buf_bytes_);
+    }
   }
 
   if (should_enter("STATS")) {
-    ADD_HEADER("# Stats");
-
     append("total_connections_received", m.conn_stats.conn_received_cnt);
     append("total_commands_processed", m.conn_stats.command_cnt);
     append("instantaneous_ops_per_sec", m.qps);
@@ -1845,14 +1519,17 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
     append("keyspace_misses", m.events.misses);
     append("total_reads_processed", m.conn_stats.io_read_cnt);
     append("total_writes_processed", m.conn_stats.io_write_cnt);
-    append("async_writes_count", m.conn_stats.async_writes_cnt);
     append("defrag_attempt_total", m.shard_stats.defrag_attempt_total);
     append("defrag_realloc_total", m.shard_stats.defrag_realloc_total);
     append("defrag_task_invocation_total", m.shard_stats.defrag_task_invocation_total);
+    append("eval_io_coordination_total", m.coordinator_stats.eval_io_coordination_cnt);
+    append("eval_shardlocal_coordination_total",
+           m.coordinator_stats.eval_shardlocal_coordination_cnt);
+    append("eval_squashed_flushes", m.coordinator_stats.eval_squashed_flushes);
+    append("tx_schedule_cancel_total", m.coordinator_stats.tx_schedule_cancel_cnt);
   }
 
   if (should_enter("TIERED", true)) {
-    ADD_HEADER("# TIERED");
     append("tiered_entries", total.tiered_entries);
     append("tiered_bytes", total.tiered_size);
     append("tiered_reads", m.tiered_stats.tiered_reads);
@@ -1864,7 +1541,6 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
   }
 
   if (should_enter("PERSISTENCE", true)) {
-    ADD_HEADER("# PERSISTENCE");
     decltype(last_save_info_) save_info;
     {
       lock_guard lk(save_mu_);
@@ -1884,8 +1560,6 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
   }
 
   if (should_enter("REPLICATION")) {
-    ADD_HEADER("# Replication");
-
     ServerState& etl = *ServerState::tlocal();
 
     if (etl.is_master) {
@@ -1918,20 +1592,14 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
   }
 
   if (should_enter("COMMANDSTATS", true)) {
-    ADD_HEADER("# Commandstats");
-
-    auto unknown_cmd = service_.UknownCmdMap();
-
     auto append_sorted = [&append](string_view prefix, auto display) {
       sort(display.begin(), display.end());
-
       for (const auto& k_v : display) {
         append(StrCat(prefix, k_v.first), k_v.second);
       }
     };
 
     vector<pair<string_view, string>> commands;
-
     for (const auto& [name, stats] : m.cmd_stats_map) {
       const auto calls = stats.first, sum = stats.second;
       commands.push_back(
@@ -1940,22 +1608,28 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
                                ",")});
     }
 
+    auto unknown_cmd = service_.UknownCmdMap();
+
     append_sorted("cmdstat_", move(commands));
     append_sorted("unknown_",
                   vector<pair<string_view, uint64_t>>(unknown_cmd.cbegin(), unknown_cmd.cend()));
   }
 
+  if (should_enter("SEARCH", true)) {
+    append("search_memory", m.search_stats.used_memory);
+    append("search_num_indices", m.search_stats.num_indices);
+    append("search_num_entries", m.search_stats.num_entries);
+  }
+
   if (should_enter("ERRORSTATS", true)) {
-    ADD_HEADER("# Errorstats");
     for (const auto& k_v : m.conn_stats.err_count_map) {
       append(k_v.first, k_v.second);
     }
   }
 
   if (should_enter("KEYSPACE")) {
-    ADD_HEADER("# Keyspace");
-    for (size_t i = 0; i < m.db.size(); ++i) {
-      const auto& stats = m.db[i];
+    for (size_t i = 0; i < m.db_stats.size(); ++i) {
+      const auto& stats = m.db_stats[i];
       bool show = (i == 0) || (stats.key_count > 0);
       if (show) {
         string val = StrCat("keys=", stats.key_count, ",expires=", stats.expire_count,
@@ -1965,8 +1639,8 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
     }
   }
 
+#ifndef __APPLE__
   if (should_enter("CPU")) {
-    ADD_HEADER("# CPU");
     struct rusage ru, cu, tu;
     getrusage(RUSAGE_SELF, &ru);
     getrusage(RUSAGE_CHILDREN, &cu);
@@ -1978,9 +1652,9 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
     append("used_cpu_sys_main_thread", StrCat(tu.ru_stime.tv_sec, ".", tu.ru_stime.tv_usec));
     append("used_cpu_user_main_thread", StrCat(tu.ru_utime.tv_sec, ".", tu.ru_utime.tv_usec));
   }
+#endif
 
   if (should_enter("CLUSTER")) {
-    ADD_HEADER("# Cluster");
     append("cluster_enabled", ClusterConfig::IsEnabledOrEmulated());
   }
 
@@ -2043,7 +1717,7 @@ void ServerFamily::Hello(CmdArgList args, ConnectionContext* cntx) {
   }
 
   if (has_setname) {
-    cntx->owner()->SetName(string{clientname});
+    cntx->conn()->SetName(string{clientname});
   }
 
   int proto_version = 2;
@@ -2065,7 +1739,7 @@ void ServerFamily::Hello(CmdArgList args, ConnectionContext* cntx) {
   (*cntx)->SendBulkString("proto");
   (*cntx)->SendLong(proto_version);
   (*cntx)->SendBulkString("id");
-  (*cntx)->SendLong(cntx->owner()->GetClientId());
+  (*cntx)->SendLong(cntx->conn()->GetClientId());
   (*cntx)->SendBulkString("mode");
   (*cntx)->SendBulkString("standalone");
   (*cntx)->SendBulkString("role");
@@ -2087,7 +1761,7 @@ void ServerFamily::ReplicaOfInternal(string_view host, string_view port_sv, Conn
   // 2. Leave the DB in a consistent state after it is done.
   // We have a relatively involved state machine inside Replica itself which handels cancellation
   // with those requirements.
-  VLOG(1) << "Acquire replica lock";
+  VLOG(2) << "Acquire replica lock";
   unique_lock lk(replicaof_mu_);
 
   if (IsReplicatingNoOne(host, port_sv)) {
@@ -2145,7 +1819,7 @@ void ServerFamily::ReplicaOfInternal(string_view host, string_view port_sv, Conn
       break;
   };
 
-  VLOG(1) << "Acquire replica lock";
+  VLOG(2) << "Acquire replica lock";
   lk.lock();
 
   // Since we released the replication lock during Start(..), we need to check if this still the
@@ -2178,6 +1852,7 @@ void ServerFamily::ReplicaOf(CmdArgList args, ConnectionContext* cntx) {
 void ServerFamily::Replicate(string_view host, string_view port) {
   io::NullSink sink;
   ConnectionContext ctxt{&sink, nullptr};
+  ctxt.skip_acl_validation = true;
 
   // we don't flush the database as the context is null
   // (and also because there is nothing to flush)
@@ -2186,8 +1861,8 @@ void ServerFamily::Replicate(string_view host, string_view port) {
 }
 
 void ServerFamily::ReplTakeOver(CmdArgList args, ConnectionContext* cntx) {
-  VLOG(1) << "Starting take over";
-  VLOG(1) << "Acquire replica lock";
+  VLOG(1) << "ReplTakeOver start";
+
   unique_lock lk(replicaof_mu_);
 
   float_t timeout_sec;
@@ -2232,7 +1907,7 @@ void ServerFamily::ReplConf(CmdArgList args, ConnectionContext* cntx) {
     if (cmd == "CAPA") {
       if (arg == "dragonfly" && args.size() == 2 && i == 0) {
         auto [sid, replica_info] = dfly_cmd_->CreateSyncSession(cntx);
-        cntx->owner()->SetName(absl::StrCat("repl_ctrl_", sid));
+        cntx->conn()->SetName(absl::StrCat("repl_ctrl_", sid));
 
         string sync_id = absl::StrCat("SYNC", sid);
         cntx->conn_state.replication_info.repl_session_id = sid;
@@ -2267,9 +1942,7 @@ void ServerFamily::ReplConf(CmdArgList args, ConnectionContext* cntx) {
       if (!absl::SimpleAtoi(arg, &version)) {
         return (*cntx)->SendError(kInvalidIntErr);
       }
-      VLOG(1) << "Client version for session_id="
-              << cntx->conn_state.replication_info.repl_session_id << " is " << version;
-      cntx->conn_state.replication_info.repl_version = DflyVersion(version);
+      dfly_cmd_->SetDflyClientVersion(cntx, DflyVersion(version));
     } else if (cmd == "ACK" && args.size() == 2) {
       // Don't send error/Ok back through the socket, because we don't want to interleave with
       // the journal writes that we write into the same socket.
@@ -2284,11 +1957,11 @@ void ServerFamily::ReplConf(CmdArgList args, ConnectionContext* cntx) {
         LOG(ERROR) << "Bad int in REPLCONF ACK command! arg=" << arg;
         return;
       }
-      VLOG(1) << "Received client ACK=" << ack;
+      VLOG(2) << "Received client ACK=" << ack;
       cntx->replication_flow->last_acked_lsn = ack;
       return;
     } else {
-      VLOG(1) << cmd << " " << arg << " " << args.size();
+      VLOG(1) << "Error " << cmd << " " << arg << " " << args.size();
       goto err;
     }
   }
@@ -2412,36 +2085,111 @@ void ServerFamily::Dfly(CmdArgList args, ConnectionContext* cntx) {
   dfly_cmd_->Run(args, cntx);
 }
 
+void ServerFamily::SlowLog(CmdArgList args, ConnectionContext* cntx) {
+  ToUpper(&args[0]);
+  string_view sub_cmd = ArgS(args, 0);
+
+  if (sub_cmd == "HELP") {
+    string_view help[] = {
+        "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        "GET [<count>]",
+        "    Return top <count> entries from the slowlog (default: 10, -1 mean all).",
+        "    Entries are made of:",
+        "    id, timestamp, time in microseconds, arguments array, client IP and port,",
+        "    client name",
+        "LEN",
+        "    Return the length of the slowlog.",
+        "RESET",
+        "    Reset the slowlog.",
+        "HELP",
+        "    Prints this help.",
+    };
+    (*cntx)->SendSimpleStrArr(help);
+    return;
+  }
+
+  if (sub_cmd == "LEN") {
+    vector<int> lengths(service_.proactor_pool().size());
+    service_.proactor_pool().AwaitFiberOnAll([&lengths](auto index, auto* context) {
+      lengths[index] = ServerState::tlocal()->GetSlowLog().Length();
+    });
+    int sum = std::accumulate(lengths.begin(), lengths.end(), 0);
+    return (*cntx)->SendLong(sum);
+  }
+
+  if (sub_cmd == "RESET") {
+    service_.proactor_pool().AwaitFiberOnAll(
+        [](auto index, auto* context) { ServerState::tlocal()->GetSlowLog().Reset(); });
+    return (*cntx)->SendOk();
+  }
+
+  if (sub_cmd == "GET") {
+    return SlowLogGet(args, cntx, service_, sub_cmd);
+  }
+  (*cntx)->SendError(UnknownSubCmd(sub_cmd, "SLOWLOG"), kSyntaxErrType);
+}
+
 #define HFUNC(x) SetHandler(HandlerFunc(this, &ServerFamily::x))
+
+namespace acl {
+constexpr uint32_t kAuth = FAST | CONNECTION;
+constexpr uint32_t kBGSave = ADMIN | SLOW | DANGEROUS;
+constexpr uint32_t kClient = SLOW | CONNECTION;
+constexpr uint32_t kConfig = ADMIN | SLOW | DANGEROUS;
+constexpr uint32_t kDbSize = KEYSPACE | READ | FAST;
+constexpr uint32_t kDebug = ADMIN | SLOW | DANGEROUS;
+constexpr uint32_t kFlushDB = KEYSPACE | WRITE | SLOW | DANGEROUS;
+constexpr uint32_t kFlushAll = KEYSPACE | WRITE | SLOW | DANGEROUS;
+constexpr uint32_t kInfo = SLOW | DANGEROUS;
+constexpr uint32_t kHello = FAST | CONNECTION;
+constexpr uint32_t kLastSave = ADMIN | FAST | DANGEROUS;
+constexpr uint32_t kLatency = ADMIN | SLOW | DANGEROUS;
+constexpr uint32_t kMemory = READ | SLOW;
+constexpr uint32_t kSave = ADMIN | SLOW | DANGEROUS;
+constexpr uint32_t kShutDown = ADMIN | SLOW | DANGEROUS;
+constexpr uint32_t kSlaveOf = ADMIN | SLOW | DANGEROUS;
+constexpr uint32_t kReplicaOf = ADMIN | SLOW | DANGEROUS;
+constexpr uint32_t kReplTakeOver = DANGEROUS;
+constexpr uint32_t kReplConf = ADMIN | SLOW | DANGEROUS;
+constexpr uint32_t kRole = ADMIN | FAST | DANGEROUS;
+constexpr uint32_t kSlowLog = ADMIN | SLOW | DANGEROUS;
+constexpr uint32_t kScript = SLOW | SCRIPTING;
+// TODO(check this)
+constexpr uint32_t kDfly = ADMIN;
+}  // namespace acl
 
 void ServerFamily::Register(CommandRegistry* registry) {
   constexpr auto kReplicaOpts = CO::LOADING | CO::ADMIN | CO::GLOBAL_TRANS;
   constexpr auto kMemOpts = CO::LOADING | CO::READONLY | CO::FAST | CO::NOSCRIPT;
-
-  *registry << CI{"AUTH", CO::NOSCRIPT | CO::FAST | CO::LOADING, -2, 0, 0, 0}.HFUNC(Auth)
-            << CI{"BGSAVE", CO::ADMIN | CO::GLOBAL_TRANS, 1, 0, 0, 0}.HFUNC(Save)
-            << CI{"CLIENT", CO::NOSCRIPT | CO::LOADING, -2, 0, 0, 0}.HFUNC(Client)
-            << CI{"CONFIG", CO::ADMIN, -2, 0, 0, 0}.HFUNC(Config)
-            << CI{"DBSIZE", CO::READONLY | CO::FAST | CO::LOADING, 1, 0, 0, 0}.HFUNC(DbSize)
-            << CI{"DEBUG", CO::ADMIN | CO::LOADING, -2, 0, 0, 0}.HFUNC(Debug)
-            << CI{"FLUSHDB", CO::WRITE | CO::GLOBAL_TRANS, 1, 0, 0, 0}.HFUNC(FlushDb)
-            << CI{"FLUSHALL", CO::WRITE | CO::GLOBAL_TRANS, -1, 0, 0, 0}.HFUNC(FlushAll)
-            << CI{"INFO", CO::LOADING, -1, 0, 0, 0}.HFUNC(Info)
-            << CI{"HELLO", CO::LOADING, -1, 0, 0, 0}.HFUNC(Hello)
-            << CI{"LASTSAVE", CO::LOADING | CO::FAST, 1, 0, 0, 0}.HFUNC(LastSave)
-            << CI{"LATENCY", CO::NOSCRIPT | CO::LOADING | CO::FAST, -2, 0, 0, 0}.HFUNC(Latency)
-            << CI{"MEMORY", kMemOpts, -2, 0, 0, 0}.HFUNC(Memory)
-            << CI{"SAVE", CO::ADMIN | CO::GLOBAL_TRANS, -1, 0, 0, 0}.HFUNC(Save)
-            << CI{"SHUTDOWN", CO::ADMIN | CO::NOSCRIPT | CO::LOADING, -1, 0, 0, 0}.HFUNC(
-                   ShutdownCmd)
-            << CI{"SLAVEOF", kReplicaOpts, 3, 0, 0, 0}.HFUNC(ReplicaOf)
-            << CI{"REPLICAOF", kReplicaOpts, 3, 0, 0, 0}.HFUNC(ReplicaOf)
-            << CI{"REPLTAKEOVER", CO::ADMIN | CO::GLOBAL_TRANS, 2, 0, 0, 0}.HFUNC(ReplTakeOver)
-            << CI{"REPLCONF", CO::ADMIN | CO::LOADING, -1, 0, 0, 0}.HFUNC(ReplConf)
-            << CI{"ROLE", CO::LOADING | CO::FAST | CO::NOSCRIPT, 1, 0, 0, 0}.HFUNC(Role)
-            << CI{"SLOWLOG", CO::ADMIN | CO::FAST, -2, 0, 0, 0}.SetHandler(SlowLog)
-            << CI{"SCRIPT", CO::NOSCRIPT | CO::NO_KEY_JOURNAL, -2, 0, 0, 0}.HFUNC(Script)
-            << CI{"DFLY", CO::ADMIN | CO::GLOBAL_TRANS | CO::HIDDEN, -2, 0, 0, 0}.HFUNC(Dfly);
+  registry->StartFamily();
+  *registry
+      << CI{"AUTH", CO::NOSCRIPT | CO::FAST | CO::LOADING, -2, 0, 0, 0, acl::kAuth}.HFUNC(Auth)
+      << CI{"BGSAVE", CO::ADMIN | CO::GLOBAL_TRANS, 1, 0, 0, 0, acl::kBGSave}.HFUNC(Save)
+      << CI{"CLIENT", CO::NOSCRIPT | CO::LOADING, -2, 0, 0, 0, acl::kClient}.HFUNC(Client)
+      << CI{"CONFIG", CO::ADMIN, -2, 0, 0, 0, acl::kConfig}.HFUNC(Config)
+      << CI{"DBSIZE", CO::READONLY | CO::FAST | CO::LOADING, 1, 0, 0, 0, acl::kDbSize}.HFUNC(DbSize)
+      << CI{"DEBUG", CO::ADMIN | CO::LOADING, -2, 0, 0, 0, acl::kDebug}.HFUNC(Debug)
+      << CI{"FLUSHDB", CO::WRITE | CO::GLOBAL_TRANS, 1, 0, 0, 0, acl::kFlushDB}.HFUNC(FlushDb)
+      << CI{"FLUSHALL", CO::WRITE | CO::GLOBAL_TRANS, -1, 0, 0, 0, acl::kFlushAll}.HFUNC(FlushAll)
+      << CI{"INFO", CO::LOADING, -1, 0, 0, 0, acl::kInfo}.HFUNC(Info)
+      << CI{"HELLO", CO::LOADING, -1, 0, 0, 0, acl::kHello}.HFUNC(Hello)
+      << CI{"LASTSAVE", CO::LOADING | CO::FAST, 1, 0, 0, 0, acl::kLastSave}.HFUNC(LastSave)
+      << CI{"LATENCY", CO::NOSCRIPT | CO::LOADING | CO::FAST, -2, 0, 0, 0, acl::kLatency}.HFUNC(
+             Latency)
+      << CI{"MEMORY", kMemOpts, -2, 0, 0, 0, acl::kMemory}.HFUNC(Memory)
+      << CI{"SAVE", CO::ADMIN | CO::GLOBAL_TRANS, -1, 0, 0, 0, acl::kSave}.HFUNC(Save)
+      << CI{"SHUTDOWN", CO::ADMIN | CO::NOSCRIPT | CO::LOADING, -1, 0, 0, 0, acl::kShutDown}.HFUNC(
+             ShutdownCmd)
+      << CI{"SLAVEOF", kReplicaOpts, 3, 0, 0, 0, acl::kSlaveOf}.HFUNC(ReplicaOf)
+      << CI{"REPLICAOF", kReplicaOpts, 3, 0, 0, 0, acl::kReplicaOf}.HFUNC(ReplicaOf)
+      << CI{"REPLTAKEOVER", CO::ADMIN | CO::GLOBAL_TRANS, 2, 0, 0, 0, acl::kReplTakeOver}.HFUNC(
+             ReplTakeOver)
+      << CI{"REPLCONF", CO::ADMIN | CO::LOADING, -1, 0, 0, 0, acl::kReplConf}.HFUNC(ReplConf)
+      << CI{"ROLE", CO::LOADING | CO::FAST | CO::NOSCRIPT, 1, 0, 0, 0, acl::kRole}.HFUNC(Role)
+      << CI{"SLOWLOG", CO::ADMIN | CO::FAST, -2, 0, 0, 0, acl::kSlowLog}.HFUNC(SlowLog)
+      << CI{"SCRIPT", CO::NOSCRIPT | CO::NO_KEY_TRANSACTIONAL, -2, 0, 0, 0, acl::kScript}.HFUNC(
+             Script)
+      << CI{"DFLY", CO::ADMIN | CO::GLOBAL_TRANS | CO::HIDDEN, -2, 0, 0, 0, acl::kDfly}.HFUNC(Dfly);
 }
 
 }  // namespace dfly

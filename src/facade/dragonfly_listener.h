@@ -25,7 +25,11 @@ class ServiceInterface;
 
 class Listener : public util::ListenerInterface {
  public:
-  Listener(Protocol protocol, ServiceInterface*);
+  // The Role PRIVILEGED is for admin port/listener
+  // The Role MAIN is for the main listener on main port
+  // The Role OTHER is for all the other listeners
+  enum class Role { PRIVILEGED, MAIN, OTHER };
+  Listener(Protocol protocol, ServiceInterface*, Role role = Role::OTHER);
   ~Listener();
 
   std::error_code ConfigureServerSocket(int fd) final;
@@ -35,12 +39,16 @@ class Listener : public util::ListenerInterface {
   bool AwaitDispatches(absl::Duration timeout,
                        const std::function<bool(util::Connection*)>& filter);
 
+  bool IsPrivilegedInterface() const;
+  bool IsMainInterface() const;
+
  private:
   util::Connection* NewConnection(ProactorBase* proactor) final;
   ProactorBase* PickConnectionProactor(util::FiberSocketBase* sock) final;
 
   void OnConnectionStart(util::Connection* conn) final;
   void OnConnectionClose(util::Connection* conn) final;
+  void OnMaxConnectionsReached(util::FiberSocketBase* sock) final;
   void PreAcceptLoop(ProactorBase* pb) final;
 
   void PreShutdown() final;
@@ -57,6 +65,8 @@ class Listener : public util::ListenerInterface {
   std::vector<PerThread> per_thread_;
 
   std::atomic_uint32_t next_id_{0};
+
+  Role role_;
 
   uint32_t conn_cnt_{0};
   uint32_t min_cnt_thread_id_{0};

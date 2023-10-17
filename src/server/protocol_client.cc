@@ -3,6 +3,8 @@
 //
 #include "server/protocol_client.h"
 
+#include "facade/tls_error.h"
+
 extern "C" {
 #include "redis/rdb.h"
 }
@@ -51,6 +53,7 @@ using absl::StrCat;
 namespace {
 
 #ifdef DFLY_USE_SSL
+
 static ProtocolClient::SSL_CTX* CreateSslClientCntx() {
   ProtocolClient::SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
   const auto& tls_key_file = GetFlag(FLAGS_tls_key_file);
@@ -58,11 +61,11 @@ static ProtocolClient::SSL_CTX* CreateSslClientCntx() {
 
   // Load client certificate if given.
   if (!tls_key_file.empty()) {
-    CHECK_EQ(1, SSL_CTX_use_PrivateKey_file(ctx, tls_key_file.c_str(), SSL_FILETYPE_PEM));
+    DFLY_SSL_CHECK(1 == SSL_CTX_use_PrivateKey_file(ctx, tls_key_file.c_str(), SSL_FILETYPE_PEM));
     // We checked that the flag is non empty in ValidateClientTlsFlags.
     const auto& tls_cert_file = GetFlag(FLAGS_tls_cert_file);
 
-    CHECK_EQ(1, SSL_CTX_use_certificate_chain_file(ctx, tls_cert_file.c_str()));
+    DFLY_SSL_CHECK(1 == SSL_CTX_use_certificate_chain_file(ctx, tls_cert_file.c_str()));
   }
 
   // Load custom certificate validation if given.
@@ -72,19 +75,19 @@ static ProtocolClient::SSL_CTX* CreateSslClientCntx() {
   const auto* file = tls_ca_cert_file.empty() ? nullptr : tls_ca_cert_file.data();
   const auto* dir = tls_ca_cert_dir.empty() ? nullptr : tls_ca_cert_dir.data();
   if (file || dir) {
-    CHECK_EQ(1, SSL_CTX_load_verify_locations(ctx, file, dir));
+    DFLY_SSL_CHECK(1 == SSL_CTX_load_verify_locations(ctx, file, dir));
   } else {
-    CHECK_EQ(1, SSL_CTX_set_default_verify_paths(ctx));
+    DFLY_SSL_CHECK(1 == SSL_CTX_set_default_verify_paths(ctx));
   }
 
-  CHECK_EQ(1, SSL_CTX_set_cipher_list(ctx, "DEFAULT"));
+  DFLY_SSL_CHECK(1 == SSL_CTX_set_cipher_list(ctx, "DEFAULT"));
   SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 
   SSL_CTX_set_options(ctx, SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS);
 
   SSL_CTX_set_verify(ctx, mask, NULL);
 
-  CHECK_EQ(1, SSL_CTX_set_dh_auto(ctx, 1));
+  DFLY_SSL_CHECK(1 == SSL_CTX_set_dh_auto(ctx, 1));
   return ctx;
 }
 #endif
@@ -216,7 +219,10 @@ error_code ProtocolClient::ResolveMasterDns() {
     LOG(ERROR) << "Dns error " << gai_strerror(resolve_res) << ", host: " << server_context_.host;
     return make_error_code(errc::host_unreachable);
   }
-  LOG(INFO) << "Resetting endpoint! " << ip_addr << ", " << server_context_.port;
+
+  LOG_IF(INFO, std::string(ip_addr) != server_context_.host)
+      << "Resolved endpoint " << server_context_.Description() << " to " << ip_addr << ":"
+      << server_context_.port;
   server_context_.endpoint = {ip::make_address(ip_addr), server_context_.port};
 
   return error_code{};
@@ -315,6 +321,7 @@ io::Result<ProtocolClient::ReadRespRes> ProtocolClient::ReadRespReply(base::IoBu
   while (!ec) {
     uint32_t consumed;
     if (buffer->InputLen() == 0 || result == RedisParser::INPUT_PENDING) {
+      DCHECK_GT(buffer->AppendLen(), 0u);
       io::MutableBytes buf = buffer->AppendBuffer();
       io::Result<size_t> size_res = sock_->Recv(buf);
       if (!size_res) {
@@ -343,6 +350,11 @@ io::Result<ProtocolClient::ReadRespRes> ProtocolClient::ReadRespReply(base::IoBu
     if (result != RedisParser::INPUT_PENDING) {
       LOG(ERROR) << "Invalid parser status " << result << " for response " << last_resp_;
       return nonstd::make_unexpected(std::make_error_code(std::errc::bad_message));
+    }
+
+    // We need to read more data. Check that we have enough space.
+    if (buffer->AppendLen() < 64u) {
+      buffer->EnsureCapacity(buffer->Capacity() * 2);
     }
   }
 
@@ -419,7 +431,8 @@ error_code ProtocolClient::SendCommandAndReadResponse(string_view command) {
 }
 
 void ProtocolClient::ResetParser(bool server_mode) {
-  parser_.reset(new RedisParser(server_mode));
+  // We accept any length for the parser because it has been approved by the master.
+  parser_.reset(new RedisParser(UINT32_MAX, server_mode));
 }
 
 uint64_t ProtocolClient::LastIoTime() const {

@@ -17,10 +17,12 @@ class StreamFamily {
 
  private:
   static void XAdd(CmdArgList args, ConnectionContext* cntx);
+  static void XClaim(CmdArgList args, ConnectionContext* cntx);
   static void XDel(CmdArgList args, ConnectionContext* cntx);
   static void XGroup(CmdArgList args, ConnectionContext* cntx);
   static void XInfo(CmdArgList args, ConnectionContext* cntx);
   static void XLen(CmdArgList args, ConnectionContext* cntx);
+  static void XPending(CmdArgList args, ConnectionContext* cntx);
   static void XRevRange(CmdArgList args, ConnectionContext* cntx);
   static void XRange(CmdArgList args, ConnectionContext* cntx);
   static void XRead(CmdArgList args, ConnectionContext* cntx);
@@ -28,6 +30,8 @@ class StreamFamily {
   static void XSetId(CmdArgList args, ConnectionContext* cntx);
   static void XTrim(CmdArgList args, ConnectionContext* cntx);
   static void XRangeGeneric(CmdArgList args, bool is_rev, ConnectionContext* cntx);
+  static void XAck(CmdArgList args, ConnectionContext* cntx);
+  static void XAutoClaim(CmdArgList args, ConnectionContext* cntx);
 };
 
 }  // namespace dfly

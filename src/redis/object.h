@@ -46,11 +46,6 @@
 #define OBJ_STATIC_REFCOUNT (INT_MAX-1) /* Object allocated in the stack. */
 #define OBJ_FIRST_SPECIAL_REFCOUNT OBJ_STATIC_REFCOUNT
 
-/* List related stuff */
-#define LIST_HEAD 0
-#define LIST_TAIL 1
-#define ZSET_MIN 0
-#define ZSET_MAX 1
 
 /* Error codes */
 #define C_OK                    0
@@ -185,7 +180,6 @@ void hashTypeCurrentObject(hashTypeIterator *hi, int what, unsigned char **vstr,
 sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what);
 int hashTypeGetValue(robj *o, sds field, unsigned char **vstr, unsigned int *vlen, long long *vll);
 robj *hashTypeGetValueObject(robj *o, sds field);
-int hashTypeSet(robj *o, sds field, sds value, int flags);
 robj *hashTypeDup(robj *o);
 int hashTypeGetFromListpack(robj *o, sds field,
                             unsigned char **vstr,

@@ -9,11 +9,13 @@ extern "C" {
 #include "redis/object.h"
 #include "redis/redis_aux.h"
 #include "redis/util.h"
+#include "redis/zmalloc.h"
 }
 
 #include "base/logging.h"
 #include "core/string_map.h"
 #include "facade/error.h"
+#include "server/acl/acl_commands_def.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/container_utils.h"
@@ -26,10 +28,10 @@ using namespace std;
 namespace dfly {
 
 using namespace facade;
+using absl::SimpleAtoi;
 
 namespace {
 
-constexpr size_t kMaxListPackLen = 1024;
 using IncrByParam = std::variant<double, int64_t>;
 using OptStr = std::optional<std::string>;
 enum GetAllMode : uint8_t { FIELDS = 1, VALUES = 2 };
@@ -37,12 +39,12 @@ enum GetAllMode : uint8_t { FIELDS = 1, VALUES = 2 };
 bool IsGoodForListpack(CmdArgList args, const uint8_t* lp) {
   size_t sum = 0;
   for (auto s : args) {
-    if (s.size() > server.hash_max_listpack_value)
+    if (s.size() > server.max_map_field_len)
       return false;
     sum += s.size();
   }
 
-  return lpBytes(const_cast<uint8_t*>(lp)) + sum < kMaxListPackLen;
+  return lpBytes(const_cast<uint8_t*>(lp)) + sum < server.max_listpack_map_bytes;
 }
 
 using container_utils::GetStringMap;
@@ -103,6 +105,14 @@ pair<uint8_t*, bool> LpInsert(uint8_t* lp, string_view field, string_view val, b
   }
 
   return make_pair(lp, !updated);
+}
+
+size_t EstimateListpackMinBytes(CmdArgList members) {
+  size_t bytes = 0;
+  for (const auto& member : members) {
+    bytes += (member.size() + 1);  // string + at least 1 byte for string header.
+  }
+  return bytes;
 }
 
 size_t HMapLength(const DbContext& db_cntx, const CompactObj& co) {
@@ -180,7 +190,7 @@ OpStatus OpIncrBy(const OpArgs& op_args, string_view key, string_view field, Inc
       lpb = lpBytes(lp);
       stats->listpack_bytes -= lpb;
 
-      if (lpb >= kMaxListPackLen) {
+      if (lpb >= server.max_listpack_map_bytes) {
         stats->listpack_blob_cnt--;
         StringMap* sm = HSetFamily::ConvertToStrMap(lp);
         pv.InitRobj(OBJ_HASH, kEncodingStrMap2, sm);
@@ -652,6 +662,11 @@ OpResult<uint32_t> OpSet(const OpArgs& op_args, string_view key, CmdArgList valu
 
   if (lp) {
     bool inserted;
+    size_t malloc_reserved = zmalloc_size(lp);
+    size_t min_sz = EstimateListpackMinBytes(values);
+    if (min_sz > malloc_reserved) {
+      lp = (uint8_t*)zrealloc(lp, min_sz);
+    }
     for (size_t i = 0; i < values.size(); i += 2) {
       tie(lp, inserted) = LpInsert(lp, ArgS(values, i), ArgS(values, i + 1), op_sp.skip_if_exists);
       created += inserted;
@@ -661,7 +676,7 @@ OpResult<uint32_t> OpSet(const OpArgs& op_args, string_view key, CmdArgList valu
   } else {
     DCHECK_EQ(kEncodingStrMap2, pv.Encoding());  // Dictionary
     StringMap* sm = GetStringMap(pv, op_args.db_cntx);
-
+    sm->Reserve(values.size() / 2);
     bool added;
 
     for (size_t i = 0; i < values.size(); i += 2) {
@@ -1004,8 +1019,35 @@ void HSetFamily::HStrLen(CmdArgList args, ConnectionContext* cntx) {
   }
 }
 
+void StrVecEmplaceBack(StringVec& str_vec, const listpackEntry& lp) {
+  if (lp.sval) {
+    str_vec.emplace_back(reinterpret_cast<char*>(lp.sval), lp.slen);
+    return;
+  }
+  str_vec.emplace_back(absl::StrCat(lp.lval));
+}
+
 void HSetFamily::HRandField(CmdArgList args, ConnectionContext* cntx) {
+  if (args.size() > 3) {
+    DVLOG(1) << "Wrong number of command arguments: " << args.size();
+    return (*cntx)->SendError(kSyntaxErr);
+  }
+
   string_view key = ArgS(args, 0);
+  int32_t count;
+  bool with_values = false;
+
+  if ((args.size() > 1) && (!SimpleAtoi(ArgS(args, 1), &count))) {
+    return (*cntx)->SendError("count value is not an integer", kSyntaxErrType);
+  }
+
+  if (args.size() == 3) {
+    ToUpper(&args[2]);
+    if (ArgS(args, 2) != "WITHVALUES")
+      return (*cntx)->SendError(kSyntaxErr);
+    else
+      with_values = true;
+  }
 
   auto cb = [&](Transaction* t, EngineShard* shard) -> OpResult<StringVec> {
     auto& db_slice = shard->db_slice();
@@ -1019,24 +1061,56 @@ void HSetFamily::HRandField(CmdArgList args, ConnectionContext* cntx) {
     StringVec str_vec;
 
     if (pv.Encoding() == kEncodingStrMap2) {
-      // TODO: to create real random logic.
       StringMap* string_map = (StringMap*)pv.RObjPtr();
-
-      sds key = string_map->begin()->first;
-      str_vec.emplace_back(key, sdslen(key));
+      if (args.size() == 1) {
+        auto [key, value] = string_map->RandomPair();
+        str_vec.emplace_back(key, sdslen(key));
+      } else {
+        size_t actual_count =
+            (count >= 0) ? std::min(size_t(count), string_map->Size()) : abs(count);
+        std::vector<sds> keys, vals;
+        if (count >= 0) {
+          string_map->RandomPairsUnique(actual_count, keys, vals, with_values);
+        } else {
+          string_map->RandomPairs(actual_count, keys, vals, with_values);
+        }
+        for (size_t i = 0; i < actual_count; ++i) {
+          str_vec.emplace_back(keys[i], sdslen(keys[i]));
+          if (with_values) {
+            str_vec.emplace_back(vals[i], sdslen(vals[i]));
+          }
+        }
+      }
     } else if (pv.Encoding() == kEncodingListPack) {
       uint8_t* lp = (uint8_t*)pv.RObjPtr();
       size_t lplen = lpLength(lp);
       CHECK(lplen > 0 && lplen % 2 == 0);
-
       size_t hlen = lplen / 2;
-      listpackEntry key;
-
-      lpRandomPair(lp, hlen, &key, NULL);
-      if (key.sval) {
-        str_vec.emplace_back(reinterpret_cast<char*>(key.sval), key.slen);
+      if (args.size() == 1) {
+        listpackEntry key;
+        lpRandomPair(lp, hlen, &key, NULL);
+        StrVecEmplaceBack(str_vec, key);
       } else {
-        str_vec.emplace_back(absl::StrCat(key.lval));
+        size_t actual_count = (count >= 0) ? std::min(size_t(count), hlen) : abs(count);
+        std::unique_ptr<listpackEntry[]> keys = nullptr, vals = nullptr;
+        keys = std::make_unique<listpackEntry[]>(actual_count);
+        if (with_values)
+          vals = std::make_unique<listpackEntry[]>(actual_count);
+
+        // count has been specified.
+        if (count >= 0)
+          // always returns unique entries.
+          lpRandomPairsUnique(lp, actual_count, keys.get(), vals.get());
+        else
+          // allows non-unique entries.
+          lpRandomPairs(lp, actual_count, keys.get(), vals.get());
+
+        for (size_t i = 0; i < actual_count; ++i) {
+          StrVecEmplaceBack(str_vec, keys[i]);
+          if (with_values) {
+            StrVecEmplaceBack(str_vec, vals[i]);
+          }
+        }
       }
     } else {
       LOG(ERROR) << "Invalid encoding " << pv.Encoding();
@@ -1047,8 +1121,7 @@ void HSetFamily::HRandField(CmdArgList args, ConnectionContext* cntx) {
 
   OpResult<StringVec> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
   if (result) {
-    CHECK_EQ(1u, result->size());  // TBD: to support count and withvalues.
-    (*cntx)->SendBulkString(result->front());
+    (*cntx)->SendStringArr(*result);
   } else if (result.status() == OpStatus::KEY_NOTFOUND) {
     (*cntx)->SendNull();
   } else {
@@ -1060,31 +1133,48 @@ using CI = CommandId;
 
 #define HFUNC(x) SetHandler(&HSetFamily::x)
 
+namespace acl {
+constexpr uint32_t kHDel = WRITE | HASH | FAST;
+constexpr uint32_t kHLen = READ | HASH | FAST;
+constexpr uint32_t kHExists = READ | HASH | FAST;
+constexpr uint32_t kHGet = READ | HASH | FAST;
+constexpr uint32_t kHGetAll = READ | HASH | SLOW;
+constexpr uint32_t kHMGet = READ | HASH | FAST;
+constexpr uint32_t kHMSet = WRITE | HASH | FAST;
+constexpr uint32_t kHIncrBy = WRITE | HASH | FAST;
+constexpr uint32_t kHIncrByFloat = WRITE | HASH | FAST;
+constexpr uint32_t kHKeys = READ | HASH | SLOW;
+constexpr uint32_t kHRandField = READ | HASH | SLOW;
+constexpr uint32_t kHScan = READ | HASH | SLOW;
+constexpr uint32_t kHSet = WRITE | HASH | FAST;
+constexpr uint32_t kHSetEx = WRITE | HASH | FAST;
+constexpr uint32_t kHSetNx = WRITE | HASH | FAST;
+constexpr uint32_t kHStrLen = READ | HASH | FAST;
+constexpr uint32_t kHVals = READ | HASH | SLOW;
+}  // namespace acl
+
 void HSetFamily::Register(CommandRegistry* registry) {
-  *registry << CI{"HDEL", CO::FAST | CO::WRITE, -3, 1, 1, 1}.HFUNC(HDel)
-            << CI{"HLEN", CO::FAST | CO::READONLY, 2, 1, 1, 1}.HFUNC(HLen)
-            << CI{"HEXISTS", CO::FAST | CO::READONLY, 3, 1, 1, 1}.HFUNC(HExists)
-            << CI{"HGET", CO::FAST | CO::READONLY, 3, 1, 1, 1}.HFUNC(HGet)
-            << CI{"HGETALL", CO::FAST | CO::READONLY, 2, 1, 1, 1}.HFUNC(HGetAll)
-            << CI{"HMGET", CO::FAST | CO::READONLY, -3, 1, 1, 1}.HFUNC(HMGet)
-            << CI{"HMSET", CO::WRITE | CO::FAST | CO::DENYOOM, -4, 1, 1, 1}.HFUNC(HSet)
-            << CI{"HINCRBY", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, 1}.HFUNC(HIncrBy)
-            << CI{"HINCRBYFLOAT", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, 1}.HFUNC(
-                   HIncrByFloat)
-            << CI{"HKEYS", CO::READONLY, 2, 1, 1, 1}.HFUNC(HKeys)
-
-            // TODO: add options support
-            << CI{"HRANDFIELD", CO::READONLY, 2, 1, 1, 1}.HFUNC(HRandField)
-            << CI{"HSCAN", CO::READONLY, -3, 1, 1, 1}.HFUNC(HScan)
-            << CI{"HSET", CO::WRITE | CO::FAST | CO::DENYOOM, -4, 1, 1, 1}.HFUNC(HSet)
-            << CI{"HSETEX", CO::WRITE | CO::FAST | CO::DENYOOM, -5, 1, 1, 1}.SetHandler(HSetEx)
-            << CI{"HSETNX", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, 1}.HFUNC(HSetNx)
-            << CI{"HSTRLEN", CO::READONLY | CO::FAST, 3, 1, 1, 1}.HFUNC(HStrLen)
-            << CI{"HVALS", CO::READONLY, 2, 1, 1, 1}.HFUNC(HVals);
-}
-
-uint32_t HSetFamily::MaxListPackLen() {
-  return kMaxListPackLen;
+  registry->StartFamily();
+  *registry
+      << CI{"HDEL", CO::FAST | CO::WRITE, -3, 1, 1, 1, acl::kHDel}.HFUNC(HDel)
+      << CI{"HLEN", CO::FAST | CO::READONLY, 2, 1, 1, 1, acl::kHLen}.HFUNC(HLen)
+      << CI{"HEXISTS", CO::FAST | CO::READONLY, 3, 1, 1, 1, acl::kHExists}.HFUNC(HExists)
+      << CI{"HGET", CO::FAST | CO::READONLY, 3, 1, 1, 1, acl::kHGet}.HFUNC(HGet)
+      << CI{"HGETALL", CO::FAST | CO::READONLY, 2, 1, 1, 1, acl::kHGetAll}.HFUNC(HGetAll)
+      << CI{"HMGET", CO::FAST | CO::READONLY, -3, 1, 1, 1, acl::kHMGet}.HFUNC(HMGet)
+      << CI{"HMSET", CO::WRITE | CO::FAST | CO::DENYOOM, -4, 1, 1, 1, acl::kHMSet}.HFUNC(HSet)
+      << CI{"HINCRBY", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, 1, acl::kHIncrBy}.HFUNC(HIncrBy)
+      << CI{"HINCRBYFLOAT", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, 1, acl::kHIncrByFloat}
+             .HFUNC(HIncrByFloat)
+      << CI{"HKEYS", CO::READONLY, 2, 1, 1, 1, acl::kHKeys}.HFUNC(HKeys)
+      << CI{"HRANDFIELD", CO::READONLY, -2, 1, 1, 1, acl::kHRandField}.HFUNC(HRandField)
+      << CI{"HSCAN", CO::READONLY, -3, 1, 1, 1, acl::kHScan}.HFUNC(HScan)
+      << CI{"HSET", CO::WRITE | CO::FAST | CO::DENYOOM, -4, 1, 1, 1, acl::kHSet}.HFUNC(HSet)
+      << CI{"HSETEX", CO::WRITE | CO::FAST | CO::DENYOOM, -5, 1, 1, 1, acl::kHSetEx}.SetHandler(
+             HSetEx)
+      << CI{"HSETNX", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, 1, acl::kHSetNx}.HFUNC(HSetNx)
+      << CI{"HSTRLEN", CO::READONLY | CO::FAST, 3, 1, 1, 1, acl::kHStrLen}.HFUNC(HStrLen)
+      << CI{"HVALS", CO::READONLY, 2, 1, 1, 1, acl::kHVals}.HFUNC(HVals);
 }
 
 StringMap* HSetFamily::ConvertToStrMap(uint8_t* lp) {

@@ -4,6 +4,8 @@
 
 #include "server/test_utils.h"
 
+#include "server/acl/acl_commands_def.h"
+
 extern "C" {
 #include "redis/zmalloc.h"
 }
@@ -17,11 +19,13 @@ extern "C" {
 #include "base/logging.h"
 #include "base/stl_util.h"
 #include "facade/dragonfly_connection.h"
+#include "server/acl/acl_log.h"
 #include "util/fibers/pool.h"
 
 using namespace std;
 
 ABSL_DECLARE_FLAG(string, dbfilename);
+ABSL_DECLARE_FLAG(uint32_t, num_shards);
 ABSL_FLAG(bool, force_epoll, false, "If true, uses epoll api instead iouring to run tests");
 
 namespace dfly {
@@ -66,8 +70,12 @@ void TestConnection::SendPubMessageAsync(PubMessage pmsg) {
   messages.push_back(move(pmsg));
 }
 
+std::string TestConnection::RemoteEndpointStr() const {
+  return "";
+}
+
 void TransactionSuspension::Start() {
-  CommandId cid{"TEST", CO::WRITE | CO::GLOBAL_TRANS, -1, 0, 0, 0};
+  CommandId cid{"TEST", CO::WRITE | CO::GLOBAL_TRANS, -1, 0, 0, 0, acl::NONE};
 
   transaction_ = new dfly::Transaction{&cid};
 
@@ -161,6 +169,15 @@ void BaseFamilyTest::SetUp() {
   ResetService();
 }
 
+void BaseFamilyTest::TearDown() {
+  CHECK_EQ(NumLocked(), 0U);
+
+  ShutdownService();
+
+  const TestInfo* const test_info = UnitTest::GetInstance()->current_test_info();
+  LOG(INFO) << "Finishing " << test_info->name();
+}
+
 // Test hook defined in common.cc.
 void TEST_InvalidateLockHashTag();
 
@@ -168,19 +185,22 @@ void BaseFamilyTest::ResetService() {
   if (service_ != nullptr) {
     TEST_InvalidateLockHashTag();
 
-    service_->Shutdown();
-    service_ = nullptr;
-
-    delete shard_set;
-    shard_set = nullptr;
-
-    pp_->Stop();
+    ShutdownService();
   }
 
+#ifdef __linux__
   if (absl::GetFlag(FLAGS_force_epoll)) {
     pp_.reset(fb2::Pool::Epoll(num_threads_));
   } else {
     pp_.reset(fb2::Pool::IOUring(16, num_threads_));
+  }
+#else
+  pp_.reset(fb2::Pool::Epoll(num_threads_));
+#endif
+
+  // Using a different default than production could expose bugs
+  if (absl::GetFlag(FLAGS_num_shards) == 0) {
+    absl::SetFlag(&FLAGS_num_shards, num_threads_ - 1);
   }
   pp_->Run();
   service_ = std::make_unique<Service>(pp_.get());
@@ -196,6 +216,35 @@ void BaseFamilyTest::ResetService() {
 
   const TestInfo* const test_info = UnitTest::GetInstance()->current_test_info();
   LOG(INFO) << "Starting " << test_info->name();
+
+  watchdog_fiber_ = pp_->GetNextProactor()->LaunchFiber([this] {
+    ThisFiber::SetName("Watchdog");
+
+    if (!watchdog_done_.WaitFor(120s)) {
+      LOG(ERROR) << "Deadlock detected!!!!";
+      absl::SetFlag(&FLAGS_alsologtostderr, true);
+      fb2::Mutex m;
+      shard_set->pool()->AwaitFiberOnAll([&m](unsigned index, ProactorBase* base) {
+        std::unique_lock lk(m);
+        LOG(ERROR) << "Proactor " << index << ":\n";
+        fb2::detail::FiberInterface::PrintAllFiberStackTraces();
+      });
+    }
+  });
+}
+
+void BaseFamilyTest::ShutdownService() {
+  DCHECK(service_);
+
+  service_->Shutdown();
+  service_.reset();
+  delete shard_set;
+  shard_set = nullptr;
+
+  watchdog_done_.Notify();
+  watchdog_fiber_.Join();
+
+  pp_->Stop();
 }
 
 unsigned BaseFamilyTest::NumLocked() {
@@ -209,17 +258,6 @@ unsigned BaseFamilyTest::NumLocked() {
     }
   });
   return count;
-}
-
-void BaseFamilyTest::TearDown() {
-  CHECK_EQ(NumLocked(), 0U);
-
-  service_->Shutdown();
-  service_.reset();
-  pp_->Stop();
-
-  const TestInfo* const test_info = UnitTest::GetInstance()->current_test_info();
-  LOG(INFO) << "Finishing " << test_info->name();
 }
 
 void BaseFamilyTest::WaitUntilLocked(DbIndex db_index, string_view key, double timeout) {
@@ -240,19 +278,19 @@ RespExpr BaseFamilyTest::Run(ArgSlice list) {
   return Run(GetId(), list);
 }
 
-RespExpr BaseFamilyTest::RunAdmin(std::initializer_list<const std::string_view> list) {
+RespExpr BaseFamilyTest::RunPrivileged(std::initializer_list<const std::string_view> list) {
   if (!ProactorBase::IsProactorThread()) {
-    return pp_->at(0)->Await([&] { return this->RunAdmin(list); });
+    return pp_->at(0)->Await([&] { return this->RunPrivileged(list); });
   }
   string id = GetId();
   TestConnWrapper* conn_wrapper = AddFindConn(Protocol::REDIS, id);
   // Before running the command set the connection as admin connection
-  conn_wrapper->conn()->SetAdmin(true);
+  conn_wrapper->conn()->SetPrivileged(true);
   auto res = Run(id, ArgSlice{list.begin(), list.size()});
   // After running the command set the connection as non admin connection
   // because the connction is returned to the poll. This way the next call to Run from the same
   // thread will not have the connection set as admin.
-  conn_wrapper->conn()->SetAdmin(false);
+  conn_wrapper->conn()->SetPrivileged(false);
   return res;
 }
 
@@ -421,7 +459,7 @@ RespVec BaseFamilyTest::TestConnWrapper::ParseResponse(bool fully_consumed) {
   auto s_copy = s;
 
   uint32_t consumed = 0;
-  parser_.reset(new RedisParser{false});  // Client mode.
+  parser_.reset(new RedisParser{UINT32_MAX, false});  // Client mode.
   RespVec res;
   RedisParser::Result st = parser_->Parse(buf, &consumed, &res);
 
@@ -541,6 +579,16 @@ void BaseFamilyTest::ExpectConditionWithinTimeout(const std::function<bool()>& c
       << "Timeout of " << timeout << " reached when expecting condition";
 }
 
+Fiber BaseFamilyTest::ExpectConditionWithSuspension(const std::function<bool()>& condition) {
+  TransactionSuspension tx;
+  tx.Start();
+  auto fb = pp_->at(0)->LaunchFiber([condition, tx = std::move(tx)]() mutable {
+    ExpectConditionWithinTimeout(condition);
+    tx.Terminate();
+  });
+  return fb;
+}
+
 void BaseFamilyTest::SetTestFlag(string_view flag_name, string_view new_value) {
   auto* flag = absl::FindCommandLineFlag(flag_name);
   CHECK_NE(flag, nullptr);
@@ -548,6 +596,11 @@ void BaseFamilyTest::SetTestFlag(string_view flag_name, string_view new_value) {
           << new_value;
   string error;
   CHECK(flag->ParseFrom(new_value, &error)) << "Error: " << error;
+}
+
+void BaseFamilyTest::TestInitAclFam() {
+  absl::SetFlag(&FLAGS_acllog_max_len, 0);
+  service_->TestInit();
 }
 
 }  // namespace dfly

@@ -4,9 +4,14 @@
 
 #pragma once
 
+#include <utility>
+
 #include "base/varz_value.h"
 #include "core/interpreter.h"
 #include "facade/service_interface.h"
+#include "server/acl/acl_commands_def.h"
+#include "server/acl/acl_family.h"
+#include "server/acl/user_registry.h"
 #include "server/cluster/cluster_family.h"
 #include "server/command_registry.h"
 #include "server/config_registry.h"
@@ -42,13 +47,18 @@ class Service : public facade::ServiceInterface {
   // Prepare command execution, verify and execute, reply to context
   void DispatchCommand(CmdArgList args, facade::ConnectionContext* cntx) final;
 
+  // Execute multiple consecutive commands, possibly in parallel by squashing
+  void DispatchManyCommands(absl::Span<CmdArgList> args_list,
+                            facade::ConnectionContext* cntx) final;
+
   // Check VerifyCommandExecution and invoke command with args
   bool InvokeCmd(const CommandId* cid, CmdArgList tail_args, ConnectionContext* reply_cntx,
                  bool record_stats = false);
 
   // Verify command can be executed now (check out of memory), always called immediately before
   // execution
-  std::optional<facade::ErrorReply> VerifyCommandExecution(const CommandId* cid);
+  std::optional<facade::ErrorReply> VerifyCommandExecution(const CommandId* cid,
+                                                           const ConnectionContext* cntx);
 
   // Verify command prepares excution in correct state.
   // It's usually called before command execution. Only for multi/exec transactions it's checked
@@ -64,9 +74,8 @@ class Service : public facade::ServiceInterface {
 
   facade::ConnectionStats* GetThreadLocalConnectionStats() final;
 
-  const CommandId* FindCmd(std::string_view cmd) const {
-    return registry_.Find(cmd);
-  }
+  std::pair<const CommandId*, CmdArgList> FindCmd(CmdArgList args) const;
+  const CommandId* FindCmd(std::string_view) const;
 
   CommandRegistry* mutable_registry() {
     return &registry_;
@@ -82,7 +91,7 @@ class Service : public facade::ServiceInterface {
 
   GlobalState GetGlobalState() const;
 
-  void ConfigureHttpHandlers(util::HttpListenerBase* base) final;
+  void ConfigureHttpHandlers(util::HttpListenerBase* base, bool is_privileged) final;
   void OnClose(facade::ConnectionContext* cntx) final;
   std::string GetContextInfo(facade::ConnectionContext* cntx) final;
 
@@ -107,6 +116,10 @@ class Service : public facade::ServiceInterface {
   ServerFamily& server_family() {
     return server_family_;
   }
+
+  // Utility function used in unit tests
+  // Do not use in production, only meant to be used by unit tests
+  void TestInit();
 
  private:
   static void Quit(CmdArgList args, ConnectionContext* cntx);
@@ -141,9 +154,8 @@ class Service : public facade::ServiceInterface {
   std::optional<facade::ErrorReply> CheckKeysOwnership(const CommandId* cid, CmdArgList args,
                                                        const ConnectionContext& dfly_cntx);
 
-  const CommandId* FindCmd(CmdArgList args) const;
-
-  void EvalInternal(const EvalArgs& eval_args, Interpreter* interpreter, ConnectionContext* cntx);
+  void EvalInternal(CmdArgList args, const EvalArgs& eval_args, Interpreter* interpreter,
+                    ConnectionContext* cntx);
   void CallSHA(CmdArgList args, std::string_view sha, Interpreter* interpreter,
                ConnectionContext* cntx);
 
@@ -154,16 +166,20 @@ class Service : public facade::ServiceInterface {
   void CallFromScript(ConnectionContext* cntx, Interpreter::CallArgs& args);
 
   void RegisterCommands();
+  void Register(CommandRegistry* registry);
 
   base::VarzValue::Map GetVarzStats();
 
- private:
   util::ProactorPool& pp_;
 
+  acl::UserRegistry user_registry_;
+  acl::AclFamily acl_family_;
   ServerFamily server_family_;
   ClusterFamily cluster_family_;
   CommandRegistry registry_;
   absl::flat_hash_map<std::string, unsigned> unknown_cmds_;
+
+  const CommandId* exec_cid_;  // command id of EXEC command for pipeline squashing
 
   mutable Mutex mu_;
   GlobalState global_state_ = GlobalState::ACTIVE;  // protected by mu_;

@@ -157,9 +157,9 @@ TEST_F(RdbTest, Stream) {
   EXPECT_THAT(resp, ArrLen(2));
 
   resp = Run({"xinfo", "groups", "key:1"});  // test dereferences array of size 1
-  EXPECT_THAT(resp, ArrLen(8));
-  EXPECT_THAT(resp.GetVec(), ElementsAre("name", "g2", "consumers", IntArg(0), "pending", IntArg(0),
-                                         "last-delivered-id", "1655444851523-1"));
+  EXPECT_THAT(resp, RespArray(ElementsAre("name", "g2", "consumers", IntArg(0), "pending",
+                                          IntArg(0), "last-delivered-id", "1655444851523-1",
+                                          "entries-read", IntArg(0), "lag", IntArg(0))));
 
   resp = Run({"xinfo", "groups", "key:2"});
   EXPECT_THAT(resp, ArrLen(0));
@@ -285,9 +285,9 @@ TEST_F(RdbTest, SaveManyDbs) {
   });
 
   auto metrics = GetMetrics();
-  ASSERT_EQ(2, metrics.db.size());
-  EXPECT_EQ(50000, metrics.db[0].key_count);
-  EXPECT_EQ(10000, metrics.db[1].key_count);
+  ASSERT_EQ(2, metrics.db_stats.size());
+  EXPECT_EQ(50000, metrics.db_stats[0].key_count);
+  EXPECT_EQ(10000, metrics.db_stats[1].key_count);
 
   auto save_fb = pp_->at(0)->LaunchFiber([&] {
     RespExpr resp = Run({"save"});
@@ -317,10 +317,10 @@ TEST_F(RdbTest, SaveManyDbs) {
   EXPECT_EQ(resp, "OK");
 
   metrics = GetMetrics();
-  ASSERT_EQ(2, metrics.db.size());
-  EXPECT_EQ(50000, metrics.db[0].key_count);
-  EXPECT_EQ(10000, metrics.db[1].key_count);
-  if (metrics.db[1].key_count != 10000) {
+  ASSERT_EQ(2, metrics.db_stats.size());
+  EXPECT_EQ(50000, metrics.db_stats[0].key_count);
+  EXPECT_EQ(10000, metrics.db_stats[1].key_count);
+  if (metrics.db_stats[1].key_count != 10000) {
     Run({"select", "1"});
     resp = Run({"scan", "0", "match", "ab*"});
     StringVec vec = StrArray(resp.GetVec()[1]);
@@ -332,11 +332,11 @@ TEST_F(RdbTest, SaveManyDbs) {
 
 TEST_F(RdbTest, HMapBugs) {
   // Force kEncodingStrMap2 encoding.
-  server.hash_max_listpack_value = 0;
+  server.max_map_field_len = 0;
   Run({"hset", "hmap1", "key1", "val", "key2", "val2"});
   Run({"hset", "hmap2", "key1", string(690557, 'a')});
 
-  server.hash_max_listpack_value = 32;
+  server.max_map_field_len = 32;
   Run({"debug", "reload"});
   EXPECT_EQ(2, CheckedInt({"hlen", "hmap1"}));
 }
@@ -353,10 +353,10 @@ TEST_F(RdbTest, Issue1305) {
   */
 
   // Force kEncodingStrMap2 encoding.
-  server.hash_max_listpack_value = 0;
+  server.max_map_field_len = 0;
   Run({"hset", "hmap", "key1", "val", "key2", ""});
 
-  server.hash_max_listpack_value = 32;
+  server.max_map_field_len = 32;
   Run({"debug", "reload"});
   EXPECT_EQ(2, CheckedInt({"hlen", "hmap"}));
 }

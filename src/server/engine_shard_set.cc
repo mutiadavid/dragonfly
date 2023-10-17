@@ -4,6 +4,8 @@
 
 #include "server/engine_shard_set.h"
 
+#include <absl/strings/match.h>
+
 extern "C" {
 #include "redis/object.h"
 #include "redis/zmalloc.h"
@@ -36,11 +38,17 @@ ABSL_FLAG(float, mem_defrag_threshold, 0.7,
           "defragmentation");
 
 ABSL_FLAG(float, mem_defrag_waste_threshold, 0.2,
-          "The ratio of wasted/commited memory above which we run defragmentation");
+          "The ratio of wasted/committed memory above which we run defragmentation");
 
 ABSL_FLAG(float, mem_defrag_page_utilization_threshold, 0.8,
-          "memory page under utilization threshold. Ratio between used and commited size, below "
+          "memory page under utilization threshold. Ratio between used and committed size, below "
           "this, memory in this page will defragmented");
+
+ABSL_FLAG(string, shard_round_robin_prefix, "",
+          "When non-empty, keys with hash-tags, whose hash-tag starts with this prefix are not "
+          "distributed across shards based on their value but instead via round-robin. Use "
+          "cautiously! This can efficiently support up to a few hundreds of hash-tags.");
+
 namespace dfly {
 
 using namespace util;
@@ -48,7 +56,6 @@ using absl::GetFlag;
 
 namespace {
 
-constexpr DbIndex kDefaultDbIndex = 0;
 constexpr uint64_t kCursorDoneState = 0u;
 
 vector<EngineShardSet::CachedStats> cached_stats;  // initialized in EngineShardSet::Init
@@ -71,6 +78,88 @@ ShardMemUsage ReadShardMemUsage(float wasted_ratio) {
   return usage;
 }
 
+// RoundRobinSharder implements a way to distribute keys that begin with some prefix.
+// Round-robin is disabled by default. It is not a general use-case optimization, but instead only
+// reasonable when there are a few highly contended keys, which we'd like to spread between the
+// shards evenly.
+// When enabled, the distribution is done via hash table: the hash of the key is used to look into
+// a pre-allocated vector. This means that collisions are possible, but are very unlikely if only
+// a few keys are used.
+// Thread safe.
+class RoundRobinSharder {
+ public:
+  static void Init() {
+    round_robin_prefix_ = absl::GetFlag(FLAGS_shard_round_robin_prefix);
+
+    if (IsEnabled()) {
+      // ~100k entries will consume 200kb per thread, and will allow 100 keys with < 2.5% collision
+      // probability. Since this has a considerable footprint, we only allocate when enabled. We're
+      // using a prime number close to 100k for better utilization.
+      constexpr size_t kRoundRobinSize = 100'003;
+      round_robin_shards_tl_cache_.resize(kRoundRobinSize);
+      std::fill(round_robin_shards_tl_cache_.begin(), round_robin_shards_tl_cache_.end(),
+                kInvalidSid);
+
+      std::lock_guard guard(mutex_);
+      if (round_robin_shards_.empty()) {
+        round_robin_shards_ = round_robin_shards_tl_cache_;
+      }
+    }
+  }
+
+  static void Destroy() {
+    round_robin_shards_tl_cache_.clear();
+
+    std::lock_guard guard(mutex_);
+    round_robin_shards_.clear();
+  }
+
+  static bool IsEnabled() {
+    return !round_robin_prefix_.empty();
+  }
+
+  static optional<ShardId> TryGetShardId(string_view key, XXH64_hash_t key_hash) {
+    if (!IsEnabled()) {
+      return nullopt;
+    }
+
+    DCHECK(!round_robin_shards_tl_cache_.empty());
+
+    if (!absl::StartsWith(key, round_robin_prefix_)) {
+      return nullopt;
+    }
+
+    size_t index = key_hash % round_robin_shards_tl_cache_.size();
+    ShardId sid = round_robin_shards_tl_cache_[index];
+
+    if (sid == kInvalidSid) {
+      std::lock_guard guard(mutex_);
+      sid = round_robin_shards_[index];
+      if (sid == kInvalidSid) {
+        sid = next_shard_;
+        round_robin_shards_[index] = sid;
+        next_shard_ = (next_shard_ + 1) % shard_set->size();
+      }
+      round_robin_shards_tl_cache_[index] = sid;
+    }
+
+    return sid;
+  }
+
+ private:
+  static thread_local string round_robin_prefix_;
+  static thread_local vector<ShardId> round_robin_shards_tl_cache_;
+  static vector<ShardId> round_robin_shards_ ABSL_GUARDED_BY(mutex_);
+  static ShardId next_shard_ ABSL_GUARDED_BY(mutex_);
+  static Mutex mutex_;
+};
+
+thread_local string RoundRobinSharder::round_robin_prefix_;
+thread_local vector<ShardId> RoundRobinSharder::round_robin_shards_tl_cache_;
+vector<ShardId> RoundRobinSharder::round_robin_shards_;
+ShardId RoundRobinSharder::next_shard_;
+Mutex RoundRobinSharder::mutex_;
+
 }  // namespace
 
 constexpr size_t kQueueLen = 64;
@@ -92,6 +181,15 @@ EngineShard::Stats& EngineShard::Stats::operator+=(const EngineShard::Stats& o) 
 void EngineShard::DefragTaskState::UpdateScanState(uint64_t cursor_val) {
   cursor = cursor_val;
   underutilized_found = false;
+  // Once we're done with a db, jump to the next
+  if (cursor == kCursorDoneState) {
+    dbid++;
+  }
+}
+
+void EngineShard::DefragTaskState::ResetScanState() {
+  dbid = cursor = 0u;
+  underutilized_found = false;
 }
 
 // This function checks 3 things:
@@ -102,7 +200,7 @@ void EngineShard::DefragTaskState::UpdateScanState(uint64_t cursor_val) {
 // (control by mem_defrag_waste_threshold flag)
 bool EngineShard::DefragTaskState::CheckRequired() {
   if (cursor > kCursorDoneState || underutilized_found) {
-    VLOG(1) << "cursor: " << cursor << " and underutilized_found " << underutilized_found;
+    VLOG(2) << "cursor: " << cursor << " and underutilized_found " << underutilized_found;
     return true;
   }
 
@@ -137,8 +235,19 @@ bool EngineShard::DoDefrag() {
   const float threshold = GetFlag(FLAGS_mem_defrag_page_utilization_threshold);
 
   auto& slice = db_slice();
-  DCHECK(slice.IsDbValid(kDefaultDbIndex));
-  auto [prime_table, expire_table] = slice.GetTables(kDefaultDbIndex);
+
+  // If we moved to an invalid db, skip as long as it's not the last one
+  while (!slice.IsDbValid(defrag_state_.dbid) && defrag_state_.dbid + 1 < slice.db_array_size())
+    defrag_state_.dbid++;
+
+  // If we found no valid db, we finished traversing and start from scratch next time
+  if (!slice.IsDbValid(defrag_state_.dbid)) {
+    defrag_state_.ResetScanState();
+    return false;
+  }
+
+  DCHECK(slice.IsDbValid(defrag_state_.dbid));
+  auto [prime_table, expire_table] = slice.GetTables(defrag_state_.dbid);
   PrimeTable::Cursor cur = defrag_state_.cursor;
   uint64_t reallocations = 0;
   unsigned traverses_count = 0;
@@ -158,6 +267,7 @@ bool EngineShard::DoDefrag() {
   } while (traverses_count < kMaxTraverses && cur);
 
   defrag_state_.UpdateScanState(cur.value());
+
   if (reallocations > 0) {
     VLOG(1) << "shard " << slice.shard_id() << ": successfully defrag  " << reallocations
             << " times, did it in " << traverses_count << " cursor is at the "
@@ -168,10 +278,12 @@ bool EngineShard::DoDefrag() {
             << (defrag_state_.cursor == kCursorDoneState ? "end" : "in progress")
             << " but no location for defrag were found";
   }
+
   stats_.defrag_realloc_total += reallocations;
   stats_.defrag_task_invocation_total++;
   stats_.defrag_attempt_total += attempts;
-  return defrag_state_.cursor > kCursorDoneState;
+
+  return true;
 }
 
 // the memory defragmentation task is as follow:
@@ -187,7 +299,7 @@ uint32_t EngineShard::DefragTask() {
   const auto shard_id = db_slice().shard_id();
 
   if (defrag_state_.CheckRequired()) {
-    VLOG(1) << shard_id << ": need to run defrag memory cursor state: " << defrag_state_.cursor
+    VLOG(2) << shard_id << ": need to run defrag memory cursor state: " << defrag_state_.cursor
             << ", underutilzation found: " << defrag_state_.underutilized_found;
     if (DoDefrag()) {
       // we didn't finish the scan
@@ -197,24 +309,15 @@ uint32_t EngineShard::DefragTask() {
   return kRunAtLowPriority;
 }
 
-EngineShard::EngineShard(util::ProactorBase* pb, bool update_db_time, mi_heap_t* heap)
-    : queue_(kQueueLen), txq_([](const Transaction* t) { return t->txid(); }), mi_resource_(heap),
+EngineShard::EngineShard(util::ProactorBase* pb, mi_heap_t* heap)
+    : queue_(kQueueLen),
+      txq_([](const Transaction* t) { return t->txid(); }),
+      mi_resource_(heap),
       db_slice_(pb->GetIndex(), GetFlag(FLAGS_cache_mode), this) {
   fiber_q_ = MakeFiber([this, index = pb->GetIndex()] {
     ThisFiber::SetName(absl::StrCat("shard_queue", index));
     queue_.Run();
   });
-
-  if (update_db_time) {
-    uint32_t clock_cycle_ms = 1000 / std::max<uint32_t>(1, GetFlag(FLAGS_hz));
-    if (clock_cycle_ms == 0)
-      clock_cycle_ms = 1;
-
-    fiber_periodic_ = MakeFiber([this, index = pb->GetIndex(), period_ms = clock_cycle_ms] {
-      ThisFiber::SetName(absl::StrCat("shard_periodic", index));
-      RunPeriodic(std::chrono::milliseconds(period_ms));
-    });
-  }
 
   tmp_str1 = sdsempty();
 
@@ -243,12 +346,23 @@ void EngineShard::Shutdown() {
   ProactorBase::me()->RemoveOnIdleTask(defrag_task_);
 }
 
+void EngineShard::StartPeriodicFiber(util::ProactorBase* pb) {
+  uint32_t clock_cycle_ms = 1000 / std::max<uint32_t>(1, GetFlag(FLAGS_hz));
+  if (clock_cycle_ms == 0)
+    clock_cycle_ms = 1;
+
+  fiber_periodic_ = MakeFiber([this, index = pb->GetIndex(), period_ms = clock_cycle_ms] {
+    ThisFiber::SetName(absl::StrCat("shard_periodic", index));
+    RunPeriodic(std::chrono::milliseconds(period_ms));
+  });
+}
+
 void EngineShard::InitThreadLocal(ProactorBase* pb, bool update_db_time) {
   CHECK(shard_ == nullptr) << pb->GetIndex();
 
   mi_heap_t* data_heap = ServerState::tlocal()->data_heap();
   void* ptr = mi_heap_malloc_aligned(data_heap, sizeof(EngineShard), alignof(EngineShard));
-  shard_ = new (ptr) EngineShard(pb, update_db_time, data_heap);
+  shard_ = new (ptr) EngineShard(pb, data_heap);
 
   CompactObj::InitThreadLocal(shard_->memory_resource());
   SmallString::InitThreadLocal(data_heap);
@@ -265,7 +379,14 @@ void EngineShard::InitThreadLocal(ProactorBase* pb, bool update_db_time) {
     CHECK(!ec) << ec.message();  // TODO
   }
 
+  RoundRobinSharder::Init();
+
   shard_->shard_search_indices_.reset(new ShardDocIndices());
+
+  if (update_db_time) {
+    // Must be last, as it accesses objects initialized above.
+    shard_->StartPeriodicFiber(pb);
+  }
 }
 
 void EngineShard::DestroyThreadLocal() {
@@ -282,6 +403,7 @@ void EngineShard::DestroyThreadLocal() {
   shard_ = nullptr;
   CompactObj::InitThreadLocal(nullptr);
   mi_heap_delete(tlh);
+  RoundRobinSharder::Destroy();
   VLOG(1) << "Shard reset " << index;
 }
 
@@ -502,7 +624,7 @@ void EngineShard::RunPeriodic(std::chrono::milliseconds period_ms) {
   while (true) {
     Heartbeat();
     if (fiber_periodic_done_.WaitFor(period_ms)) {
-      VLOG(1) << "finished running engine shard periodic task";
+      VLOG(2) << "finished running engine shard periodic task";
       return;
     }
   }
@@ -533,7 +655,8 @@ void EngineShard::CacheStats() {
 }
 
 size_t EngineShard::UsedMemory() const {
-  return mi_resource_.used() + zmalloc_used_memory_tl + SmallString::UsedThreadLocal();
+  return mi_resource_.used() + zmalloc_used_memory_tl + SmallString::UsedThreadLocal() +
+         search_indices()->GetUsedMemory();
 }
 
 BlockingController* EngineShard::EnsureBlockingController() {
@@ -594,6 +717,28 @@ void EngineShardSet::TEST_EnableHeartBeat() {
 
 void EngineShardSet::TEST_EnableCacheMode() {
   RunBriefInParallel([](EngineShard* shard) { shard->db_slice().TEST_EnableCacheMode(); });
+}
+
+ShardId Shard(string_view v, ShardId shard_num) {
+  bool has_hashtags = false;
+  if (ClusterConfig::IsEnabledOrEmulated()) {
+    string_view v_hash_tag = ClusterConfig::KeyTag(v);
+    if (v_hash_tag.size() != v.size()) {
+      has_hashtags = true;
+      v = v_hash_tag;
+    }
+  }
+
+  XXH64_hash_t hash = XXH64(v.data(), v.size(), 120577240643ULL);
+
+  if (has_hashtags) {
+    auto round_robin = RoundRobinSharder::TryGetShardId(v, hash);
+    if (round_robin.has_value()) {
+      return *round_robin;
+    }
+  }
+
+  return hash % shard_num;
 }
 
 }  // namespace dfly

@@ -5,6 +5,8 @@ import glob
 import asyncio
 from redis import asyncio as aioredis
 from pathlib import Path
+import boto3
+import logging
 
 from . import dfly_args
 from .utility import DflySeeder, wait_available_async
@@ -44,6 +46,7 @@ class TestRdbSnapshot(SnapshotTestBase):
         super().setup(tmp_dir)
 
     @pytest.mark.asyncio
+    @pytest.mark.slow
     async def test_snapshot(self, df_seeder_factory, async_client, df_server):
         seeder = df_seeder_factory.create(port=df_server.port, **SEEDER_ARGS)
         await seeder.run(target_deviation=0.1)
@@ -55,7 +58,7 @@ class TestRdbSnapshot(SnapshotTestBase):
         assert await async_client.flushall()
         await async_client.execute_command("DEBUG LOAD " + super().get_main_file("test-rdb-*.rdb"))
 
-        assert await seeder.compare(start_capture)
+        assert await seeder.compare(start_capture, port=df_server.port)
 
 
 @dfly_args({**BASIC_ARGS, "dbfilename": "test-rdbexact.rdb", "nodf_snapshot_format": None})
@@ -67,6 +70,7 @@ class TestRdbSnapshotExactFilename(SnapshotTestBase):
         super().setup(tmp_dir)
 
     @pytest.mark.asyncio
+    @pytest.mark.slow
     async def test_snapshot(self, df_seeder_factory, async_client, df_server):
         seeder = df_seeder_factory.create(port=df_server.port, **SEEDER_ARGS)
         await seeder.run(target_deviation=0.1)
@@ -79,7 +83,7 @@ class TestRdbSnapshotExactFilename(SnapshotTestBase):
         main_file = super().get_main_file("test-rdbexact.rdb")
         await async_client.execute_command("DEBUG LOAD " + main_file)
 
-        assert await seeder.compare(start_capture)
+        assert await seeder.compare(start_capture, port=df_server.port)
 
 
 @dfly_args({**BASIC_ARGS, "dbfilename": "test-dfs"})
@@ -91,6 +95,7 @@ class TestDflySnapshot(SnapshotTestBase):
         self.tmp_dir = tmp_dir
 
     @pytest.mark.asyncio
+    @pytest.mark.slow
     async def test_snapshot(self, df_seeder_factory, async_client, df_server):
         seeder = df_seeder_factory.create(port=df_server.port, **SEEDER_ARGS)
         await seeder.run(target_deviation=0.1)
@@ -104,7 +109,7 @@ class TestDflySnapshot(SnapshotTestBase):
             "DEBUG LOAD " + super().get_main_file("test-dfs-summary.dfs")
         )
 
-        assert await seeder.compare(start_capture)
+        assert await seeder.compare(start_capture, port=df_server.port)
 
 
 # We spawn instances manually, so reduce memory usage of default to minimum
@@ -132,20 +137,16 @@ class TestDflyAutoLoadSnapshot(SnapshotTestBase):
     async def test_snapshot(self, df_local_factory, save_type, dbfilename):
         df_args = {"dbfilename": dbfilename, **BASIC_ARGS, "port": 1111}
         if save_type == "rdb":
-            df_args["nodf_snapshot_format"] = ""
-        df_server = df_local_factory.create(**df_args)
-        df_server.start()
+            df_args["nodf_snapshot_format"] = None
+        with df_local_factory.create(**df_args) as df_server:
+            async with df_server.client() as client:
+                await client.set("TEST", hash(dbfilename))
+                await client.execute_command("SAVE " + save_type)
 
-        client = aioredis.Redis(port=df_server.port)
-        await client.set("TEST", hash(dbfilename))
-        await client.execute_command("SAVE " + save_type)
-        df_server.stop()
-
-        df_server2 = df_local_factory.create(**df_args)
-        df_server2.start()
-        client = aioredis.Redis(port=df_server.port)
-        response = await client.get("TEST")
-        assert response.decode("utf-8") == str(hash(dbfilename))
+        with df_local_factory.create(**df_args) as df_server:
+            async with df_server.client() as client:
+                response = await client.get("TEST")
+                assert response.decode("utf-8") == str(hash(dbfilename))
 
 
 @dfly_args({**BASIC_ARGS, "dbfilename": "test-periodic", "save_schedule": "*:*"})
@@ -157,6 +158,7 @@ class TestPeriodicSnapshot(SnapshotTestBase):
         super().setup(tmp_dir)
 
     @pytest.mark.asyncio
+    @pytest.mark.slow
     async def test_snapshot(self, df_seeder_factory, df_server):
         seeder = df_seeder_factory.create(
             port=df_server.port, keys=10, multi_transaction_probability=0
@@ -178,6 +180,7 @@ class TestCronPeriodicSnapshot(SnapshotTestBase):
         super().setup(tmp_dir)
 
     @pytest.mark.asyncio
+    @pytest.mark.slow
     async def test_snapshot(self, df_seeder_factory, df_server):
         seeder = df_seeder_factory.create(
             port=df_server.port, keys=10, multi_transaction_probability=0
@@ -217,6 +220,7 @@ class TestDflySnapshotOnShutdown(SnapshotTestBase):
         self.tmp_dir = tmp_dir
 
     @pytest.mark.asyncio
+    @pytest.mark.slow
     async def test_snapshot(self, df_seeder_factory, df_server):
         seeder = df_seeder_factory.create(port=df_server.port, **SEEDER_ARGS)
         await seeder.run(target_deviation=0.1)
@@ -230,7 +234,7 @@ class TestDflySnapshotOnShutdown(SnapshotTestBase):
         await wait_available_async(a_client)
         await a_client.connection_pool.disconnect()
 
-        assert await seeder.compare(start_capture)
+        assert await seeder.compare(start_capture, port=df_server.port)
 
 
 @dfly_args({**BASIC_ARGS, "dbfilename": "test-info-persistence"})
@@ -259,3 +263,57 @@ class TestDflyInfoPersistenceLoadingField(SnapshotTestBase):
         assert "0" == self.extract_is_loading_field(res)
 
         await a_client.connection_pool.disconnect()
+
+
+# If DRAGONFLY_S3_BUCKET is configured, AWS credentials must also be
+# configured.
+@pytest.mark.skipif(
+    "DRAGONFLY_S3_BUCKET" not in os.environ, reason="AWS S3 snapshots bucket is not configured"
+)
+@dfly_args({"dir": "s3://{DRAGONFLY_S3_BUCKET}{DRAGONFLY_TMP}", "dbfilename": ""})
+class TestS3Snapshot:
+    """Test a snapshot using S3 storage"""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_dir: Path):
+        self.tmp_dir = tmp_dir
+
+    @pytest.mark.asyncio
+    @pytest.mark.slow
+    async def test_snapshot(self, df_seeder_factory, async_client, df_server):
+        seeder = df_seeder_factory.create(port=df_server.port, **SEEDER_ARGS)
+        await seeder.run(target_deviation=0.1)
+
+        start_capture = await seeder.capture()
+
+        try:
+            # save + flush + load
+            await async_client.execute_command("SAVE DF snapshot")
+            assert await async_client.flushall()
+            await async_client.execute_command(
+                "DEBUG LOAD "
+                + os.environ["DRAGONFLY_S3_BUCKET"]
+                + str(self.tmp_dir)
+                + "/snapshot-summary.dfs"
+            )
+
+            assert await seeder.compare(start_capture, port=df_server.port)
+        finally:
+            self._delete_objects(
+                os.environ["DRAGONFLY_S3_BUCKET"],
+                str(self.tmp_dir)[1:],
+            )
+
+    def _delete_objects(self, bucket, prefix):
+        client = boto3.client("s3")
+        resp = client.list_objects_v2(
+            Bucket=bucket,
+            Prefix=prefix,
+        )
+        keys = []
+        for obj in resp["Contents"]:
+            keys.append({"Key": obj["Key"]})
+        client.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": keys},
+        )

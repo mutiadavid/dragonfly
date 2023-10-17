@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 from time import sleep
+from typing import Dict, List, Union
 from redis import asyncio as aioredis
 import pytest
 import pytest_asyncio
@@ -18,7 +19,8 @@ from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from . import DflyInstance, DflyInstanceFactory, DflyParams, PortPicker, dfly_args
+from .instance import DflyInstance, DflyParams, DflyInstanceFactory
+from . import PortPicker, dfly_args
 from .utility import DflySeederFactory, gen_certificate
 
 logging.getLogger("asyncio").setLevel(logging.WARNING)
@@ -61,6 +63,18 @@ def df_seeder_factory(request) -> DflySeederFactory:
     return DflySeederFactory(request.config.getoption("--log-seeder"))
 
 
+def parse_args(args: List[str]) -> Dict[str, Union[str, None]]:
+    args_dict = {}
+    for arg in args:
+        if "=" in arg:
+            pos = arg.find("=")
+            name, value = arg[:pos], arg[pos + 1 :]
+            args_dict[name] = value
+        else:
+            args_dict[arg] = None
+    return args_dict
+
+
 @pytest.fixture(scope="session", params=[{}])
 def df_factory(request, tmp_dir, test_env) -> DflyInstanceFactory:
     """
@@ -77,7 +91,8 @@ def df_factory(request, tmp_dir, test_env) -> DflyInstanceFactory:
         path=path,
         cwd=tmp_dir,
         gdb=request.config.getoption("--gdb"),
-        args=request.config.getoption("--df"),
+        buffered_out=request.config.getoption("--buffered-output"),
+        args=parse_args(request.config.getoption("--df")),
         existing_port=int(existing) if existing else None,
         existing_admin_port=int(existing_admin) if existing_admin else None,
         existing_mc_port=int(existing_mc) if existing_mc else None,
@@ -191,17 +206,14 @@ async def async_client(async_pool):
 
 
 def pytest_addoption(parser):
-    """
-    Custom pytest options:
-        --gdb - start all instances inside gdb
-        --df arg - pass arg to all instances, can be used multiple times
-        --log-seeder file - to log commands of last seeder run
-        --existing-port - to provide a port to an existing process instead of starting a new instance
-        --existing-admin-port - to provide an admin port to an existing process instead of starting a new instance
-        --rand-seed - to set the global random seed
-    """
     parser.addoption("--gdb", action="store_true", default=False, help="Run instances in gdb")
     parser.addoption("--df", action="append", default=[], help="Add arguments to dragonfly")
+    parser.addoption(
+        "--buffered-output",
+        action="store_true",
+        default=False,
+        help="Makes instance output buffered, grouping it together",
+    )
     parser.addoption(
         "--log-seeder", action="store", default=None, help="Store last generator commands in file"
     )
@@ -223,7 +235,6 @@ def pytest_addoption(parser):
         default=None,
         help="Provide an admin port to the existing process for the test",
     )
-
     parser.addoption(
         "--existing-mc-port",
         action="store",
@@ -272,7 +283,7 @@ def with_tls_server_args(tmp_dir, gen_ca_cert):
         tls_server_cert,
     )
 
-    args = {"tls": "", "tls_key_file": tls_server_key, "tls_cert_file": tls_server_cert}
+    args = {"tls": None, "tls_key_file": tls_server_key, "tls_cert_file": tls_server_cert}
     return args
 
 

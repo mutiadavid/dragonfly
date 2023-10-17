@@ -52,19 +52,25 @@ std::string MallocStats(bool backing, unsigned tid) {
   mi_heap_visit_blocks(data_heap, false /* visit all blocks*/, MiArenaVisit, &block_map);
   uint64_t reserved = 0, committed = 0, used = 0;
   for (const auto& k_v : block_map) {
-    absl::StrAppend(&str, k_v.second, " ", get<0>(k_v.first), " ", get<1>(k_v.first), " ",
+    uint64_t count = k_v.second;
+    absl::StrAppend(&str, count, " ", get<0>(k_v.first), " ", get<1>(k_v.first), " ",
                     get<2>(k_v.first), " ", get<3>(k_v.first), "\n");
-    reserved += k_v.second * get<1>(k_v.first);
-    committed += k_v.second * get<2>(k_v.first);
-    used += k_v.second * get<3>(k_v.first);
+    reserved += count * get<1>(k_v.first);
+    committed += count * get<2>(k_v.first);
+    used += count * get<3>(k_v.first);
   }
 
   uint64_t delta = (absl::GetCurrentTimeNanos() - start) / 1000;
   absl::StrAppend(&str, "--- End mimalloc statistics, took ", delta, "us ---\n");
   absl::StrAppend(&str, "total reserved: ", reserved, ", comitted: ", committed, ", used: ", used,
-                  "\n");
+                  "fragmentation waste: ",
+                  (100.0 * (committed - used)) / std::max<size_t>(1UL, committed), "%\n");
 
   return str;
+}
+
+size_t MemoryUsage(PrimeIterator it) {
+  return it->first.MallocUsed() + it->second.MallocUsed();
 }
 
 }  // namespace
@@ -81,15 +87,14 @@ void MemoryCmd::Run(CmdArgList args) {
         "MALLOC-STATS [BACKING] [thread-id]",
         "    Show malloc stats for a heap residing in specified thread-id. 0 by default.",
         "    If BACKING is specified, show stats for the backing heap.",
-        "USAGE",
-        "    (not implemented).",
+        "USAGE <key>",
     };
     return (*cntx_)->SendSimpleStrArr(help_arr);
   };
 
-  if (sub_cmd == "USAGE") {
-    // dummy output, in practice not implemented yet.
-    return (*cntx_)->SendLong(1);
+  if (sub_cmd == "USAGE" && args.size() > 1) {
+    string_view key = ArgS(args, 1);
+    return Usage(key);
   }
 
   if (sub_cmd == "MALLOC-STATS") {
@@ -117,6 +122,24 @@ void MemoryCmd::Run(CmdArgList args) {
 
   string err = UnknownSubCmd(sub_cmd, "MEMORY");
   return (*cntx_)->SendError(err, kSyntaxErrType);
+}
+
+void MemoryCmd::Usage(std::string_view key) {
+  ShardId sid = Shard(key, shard_set->size());
+  ssize_t memory_usage = shard_set->pool()->at(sid)->AwaitBrief([key, this]() -> ssize_t {
+    auto& db_slice = EngineShard::tlocal()->db_slice();
+    auto [pt, exp_t] = db_slice.GetTables(cntx_->db_index());
+    PrimeIterator it = pt->Find(key);
+    if (IsValid(it)) {
+      return MemoryUsage(it);
+    } else {
+      return -1;
+    }
+  });
+
+  if (memory_usage < 0)
+    return cntx_->SendError(kKeyNotFoundErr);
+  (*cntx_)->SendLong(memory_usage);
 }
 
 }  // namespace dfly

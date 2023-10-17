@@ -27,17 +27,18 @@ constexpr size_t kSizeConnStats = sizeof(ConnectionStats);
 
 ConnectionStats& ConnectionStats::operator+=(const ConnectionStats& o) {
   // To break this code deliberately if we add/remove a field to this struct.
-  static_assert(kSizeConnStats == 136u);
+  static_assert(kSizeConnStats == 144u);
 
   ADD(read_buf_capacity);
-  ADD(pipeline_cache_capacity);
+  ADD(dispatch_queue_entries);
+  ADD(dispatch_queue_bytes);
+  ADD(pipeline_cmd_cache_bytes);
   ADD(io_read_cnt);
   ADD(io_read_bytes);
   ADD(io_write_cnt);
   ADD(io_write_bytes);
   ADD(command_cnt);
   ADD(pipelined_cmd_cnt);
-  ADD(async_writes_cnt);
   ADD(conn_received_cnt);
   ADD(num_conns);
   ADD(num_replicas);
@@ -79,12 +80,14 @@ const char kInvalidDbIndErr[] = "invalid DB index";
 const char kScriptNotFound[] = "-NOSCRIPT No matching script. Please use EVAL.";
 const char kAuthRejected[] = "-WRONGPASS invalid username-password pair or user is disabled.";
 const char kExpiryOutOfRange[] = "expiry is out of range";
-const char kSyntaxErrType[] = "syntax_error";
-const char kScriptErrType[] = "script_error";
 const char kIndexOutOfRange[] = "index out of range";
 const char kOutOfMemory[] = "Out of memory";
 const char kInvalidNumericResult[] = "result is not a number";
 const char kClusterNotConfigured[] = "Cluster is not yet configured";
+
+const char kSyntaxErrType[] = "syntax_error";
+const char kScriptErrType[] = "script_error";
+const char kConfigErrType[] = "config_error";
 
 const char* RespExpr::TypeName(Type t) {
   switch (t) {
@@ -110,13 +113,16 @@ ConnectionContext::ConnectionContext(::io::Sink* stream, Connection* owner) : ow
   if (owner) {
     protocol_ = owner->protocol();
   }
-  switch (protocol_) {
-    case Protocol::REDIS:
-      rbuilder_.reset(new RedisReplyBuilder(stream));
-      break;
-    case Protocol::MEMCACHE:
-      rbuilder_.reset(new MCReplyBuilder(stream));
-      break;
+
+  if (stream) {
+    switch (protocol_) {
+      case Protocol::REDIS:
+        rbuilder_.reset(new RedisReplyBuilder(stream));
+        break;
+      case Protocol::MEMCACHE:
+        rbuilder_.reset(new MCReplyBuilder(stream));
+        break;
+    }
   }
 
   conn_closing = false;
@@ -137,9 +143,14 @@ RedisReplyBuilder* ConnectionContext::operator->() {
 }
 
 CommandId::CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first_key,
-                     int8_t last_key, int8_t step)
-    : name_(name), opt_mask_(mask), arity_(arity), first_key_(first_key), last_key_(last_key),
-      step_key_(step) {
+                     int8_t last_key, int8_t step, uint32_t acl_categories)
+    : name_(name),
+      opt_mask_(mask),
+      arity_(arity),
+      first_key_(first_key),
+      last_key_(last_key),
+      step_key_(step),
+      acl_categories_(acl_categories) {
 }
 
 uint32_t CommandId::OptCount(uint32_t mask) {

@@ -7,6 +7,7 @@
 #include <optional>
 #include <vector>
 
+#include "base/pmr/memory_resource.h"
 #include "core/search/base.h"
 
 namespace dfly::search {
@@ -50,6 +51,8 @@ class CompressedSortedSet {
   friend struct Iterator;
 
  public:
+  explicit CompressedSortedSet(PMR_NS::memory_resource* mr);
+
   ConstIterator begin() const;
   ConstIterator end() const;
 
@@ -58,6 +61,11 @@ class CompressedSortedSet {
 
   size_t Size() const;
   size_t ByteSize() const;
+
+  // To use transparently in templates together with stl containers
+  size_t size() const {
+    return Size();
+  }
 
  private:
   struct EntryLocation {
@@ -83,7 +91,7 @@ class CompressedSortedSet {
  private:
   uint32_t size_{0};
   std::optional<IntType> tail_value_{};
-  std::vector<uint8_t> diffs_{};
+  std::vector<uint8_t, PMR_NS::polymorphic_allocator<uint8_t>> diffs_;
 };
 
 }  // namespace dfly::search

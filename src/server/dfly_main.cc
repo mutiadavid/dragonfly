@@ -3,24 +3,31 @@
 // See LICENSE for licensing terms.
 //
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/strings/numbers.h"
 #ifdef NDEBUG
 #include <mimalloc-new-delete.h>
 #endif
 
+#include <absl/flags/parse.h>
 #include <absl/flags/usage.h>
 #include <absl/flags/usage_config.h>
 #include <absl/strings/match.h>
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_split.h>
 #include <absl/strings/strip.h>
+
+#ifdef __linux__
 #include <liburing.h>
+#endif
+
 #include <mimalloc.h>
 #include <openssl/err.h>
 #include <signal.h>
 
 #include <iostream>
+#include <memory>
 #include <regex>
 
 #include "base/init.h"
@@ -39,16 +46,16 @@
 #include "util/http/http_client.h"
 #include "util/varz.h"
 
-#define STRING_PP_NX(A) #A
-#define STRING_MAKE_PP(A) STRING_PP_NX(A)
-
-// This would create a string value from a "defined" location of the source code
-// Note that SOURCE_PATH_FROM_BUILD_ENV is taken from the build system
-#define BUILD_LOCATION_PATH STRING_MAKE_PP(SOURCE_PATH_FROM_BUILD_ENV)
+#ifdef __APPLE__
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#else
+extern char** environ;
+#endif
 
 using namespace std;
 
-ABSL_DECLARE_FLAG(uint32_t, port);
+ABSL_DECLARE_FLAG(int32_t, port);
 ABSL_DECLARE_FLAG(uint32_t, memcached_port);
 ABSL_DECLARE_FLAG(uint16_t, admin_port);
 ABSL_DECLARE_FLAG(std::string, admin_bind);
@@ -58,11 +65,11 @@ ABSL_FLAG(string, bind, "",
           "It's not advised due to security implications.");
 ABSL_FLAG(string, pidfile, "", "If not empty - server writes its pid into the file");
 ABSL_FLAG(string, unixsocket, "",
-          "If not empty - specifies path for the Unis socket that will "
+          "If not empty - specifies path for the Unix socket that will "
           "be used for listening for incoming connections.");
 ABSL_FLAG(string, unixsocketperm, "", "Set permissions for unixsocket, in octal value.");
 ABSL_FLAG(bool, force_epoll, false,
-          "If true - uses linux epoll engine underneath."
+          "If true - uses linux epoll engine underneath. "
           "Can fit for kernels older than 5.10.");
 
 ABSL_FLAG(bool, version_check, true,
@@ -299,6 +306,13 @@ bool HelpFlags(std::string_view f) {
   return absl::StartsWith(f, "\033[0;3");
 }
 
+#define STRING_PP_NX(A) #A
+#define STRING_MAKE_PP(A) STRING_PP_NX(A)
+
+// This would create a string value from a "defined" location of the source code
+// Note that SOURCE_PATH_FROM_BUILD_ENV is taken from the build system
+#define BUILD_LOCATION_PATH STRING_MAKE_PP(SOURCE_PATH_FROM_BUILD_ENV)
+
 string NormalizePaths(std::string_view path) {
   const std::string FULL_PATH = BUILD_LOCATION_PATH;
   const std::string FULL_PATH_SRC = FULL_PATH + "/src";
@@ -330,8 +344,11 @@ bool RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
   Listener* main_listener = nullptr;
 
   std::vector<facade::Listener*> listeners;
+  // If we ever add a new listener, plz don't change this,
+  // we depend on tcp listener to be at the front since we later
+  // need to pass it to the AclFamily::Init
   if (!tcp_disabled) {
-    main_listener = new Listener{Protocol::REDIS, &service};
+    main_listener = new Listener{Protocol::REDIS, &service, Listener::Role::MAIN};
     listeners.push_back(main_listener);
   }
 
@@ -339,14 +356,33 @@ bool RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
   opts.disable_time_update = false;
   const auto& bind = GetFlag(FLAGS_bind);
   const char* bind_addr = bind.empty() ? nullptr : bind.c_str();
-  auto port = GetFlag(FLAGS_port);
+
+  int32_t port = GetFlag(FLAGS_port);
+  // The reason for this code is a bit silly. We want to provide a way to
+  // bind any 'random' available port. The way to do that is to call
+  // bind with the argument port 0. However we can't expose this functionality
+  // as is to our users: Since giving --port=0 to redis DISABLES the network
+  // interface that would break users' existing configurations in potentionally
+  // unsafe ways. For that reason the user's --port=-1 means to us 'bind port 0'.
+  if (port == -1) {
+    port = 0;
+  } else if (port < 0 || port > 65535) {
+    LOG(ERROR) << "Bad port number " << port;
+    exit(1);
+  }
+
   auto mc_port = GetFlag(FLAGS_memcached_port);
   string unix_sock = GetFlag(FLAGS_unixsocket);
   bool unlink_uds = false;
+  absl::Cleanup maybe_unlink_uds([&unlink_uds, &unix_sock]() {
+    if (unlink_uds) {
+      unlink(unix_sock.c_str());
+    }
+  });
 
   if (!unix_sock.empty()) {
     string perm_str = GetFlag(FLAGS_unixsocketperm);
-    mode_t unix_socket_perm;
+    uint32_t unix_socket_perm;
     if (perm_str.empty()) {
       // get umask of running process, indicates the permission bits that are turned off
       mode_t umask_val = umask(0);
@@ -361,8 +397,9 @@ bool RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
     }
     unlink(unix_sock.c_str());
 
-    Listener* uds_listener = new Listener{Protocol::REDIS, &service};
-    error_code ec = acceptor->AddUDSListener(unix_sock.c_str(), unix_socket_perm, uds_listener);
+    auto uds_listener = std::make_unique<Listener>(Protocol::REDIS, &service);
+    error_code ec =
+        acceptor->AddUDSListener(unix_sock.c_str(), unix_socket_perm, uds_listener.get());
     if (ec) {
       if (tcp_disabled) {
         LOG(ERROR) << "Could not open unix socket " << unix_sock
@@ -371,10 +408,9 @@ bool RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
       } else {
         LOG(WARNING) << "Could not open unix socket " << unix_sock << ", error " << ec;
       }
-      delete uds_listener;
     } else {
       LOG(INFO) << "Listening on unix socket " << unix_sock;
-      listeners.push_back(uds_listener);
+      listeners.push_back(uds_listener.release());
       unlink_uds = true;
     }
   } else if (tcp_disabled) {
@@ -391,15 +427,15 @@ bool RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
     const char* interface_addr = admin_bind.empty() ? nullptr : admin_bind.c_str();
     const std::string printable_addr =
         absl::StrCat("admin socket ", interface_addr ? interface_addr : "any", ":", admin_port);
-    Listener* admin_listener = new Listener{Protocol::REDIS, &service};
-    error_code ec = acceptor->AddListener(interface_addr, admin_port, admin_listener);
+    auto admin_listener =
+        std::make_unique<Listener>(Protocol::REDIS, &service, Listener::Role::PRIVILEGED);
+    error_code ec = acceptor->AddListener(interface_addr, admin_port, admin_listener.get());
 
     if (ec) {
       LOG(ERROR) << "Failed to open " << printable_addr << ", error: " << ec.message();
-      delete admin_listener;
     } else {
       LOG(INFO) << "Listening on " << printable_addr;
-      listeners.push_back(admin_listener);
+      listeners.push_back(admin_listener.release());
     }
   }
 
@@ -411,6 +447,10 @@ bool RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
     if (ec) {
       LOG(ERROR) << "Could not open port " << port << ", error: " << ec.message();
       exit(1);
+    }
+
+    if (port == 0) {
+      absl::SetFlag(&FLAGS_port, main_listener->socket()->LocalEndpoint().port());
     }
   }
 
@@ -427,10 +467,6 @@ bool RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
 
   version_monitor.Shutdown();
   service.Shutdown();
-
-  if (unlink_uds) {
-    unlink(unix_sock.c_str());
-  }
 
   return true;
 }
@@ -457,6 +493,7 @@ bool CreatePidFile(const string& path) {
   return true;
 }
 
+#ifdef __linux__
 bool ShouldUseEpollAPI(const base::sys::KernelVersion& kver) {
   if (GetFlag(FLAGS_force_epoll))
     return true;
@@ -493,7 +530,7 @@ bool ShouldUseEpollAPI(const base::sys::KernelVersion& kver) {
   return true;
 }
 
-error_code GetCGroupPath(string* memory_path, string* cpu_path) {
+void GetCGroupPath(string* memory_path, string* cpu_path) {
   CHECK(memory_path != nullptr) << "memory_path is null! (this shouldn't happen!)";
   CHECK(cpu_path != nullptr) << "cpu_path is null! (this shouldn't happen!)";
 
@@ -515,12 +552,15 @@ error_code GetCGroupPath(string* memory_path, string* cpu_path) {
   if (groups.size() == 1) {
     // for v2 we only read 0::<name>
     size_t pos = cgv.rfind(':');
-    if (pos == string::npos)
-      return make_error_code(errc::not_supported);
+    if (pos == string::npos) {
+      LOG(ERROR) << "Failed to parse cgroupv2 format, got: " << cgv;
+      exit(1);
+    }
 
-    string_view res = absl::StripTrailingAsciiWhitespace(cgv.substr(pos + 1));
+    auto cgroup = string_view(cgv.c_str() + pos + 1);
+    string_view cgroup_stripped = absl::StripTrailingAsciiWhitespace(cgroup);
 
-    *memory_path = absl::StrCat("/sys/fs/cgroup/", res);
+    *memory_path = absl::StrCat("/sys/fs/cgroup/", cgroup_stripped);
     *cpu_path = *memory_path;  // in v2 the path to the cgroup is singular
   } else {
     for (const auto& sv : groups) {
@@ -542,84 +582,128 @@ error_code GetCGroupPath(string* memory_path, string* cpu_path) {
         *cpu_path = absl::StrCat("/sys/fs/cgroup/cpu,cpuacct/", entry[2]);
     }
   }
-
-  return error_code{};
 }
 
 void UpdateResourceLimitsIfInsideContainer(io::MemInfoData* mdata, size_t* max_threads) {
-  using io::Exists;
+  using absl::StrCat;
+
+  // did we succeed in reading *something*? if not, exit.
+  // note that all processes in Linux are in some cgroup, so at the very
+  // least we should read something.
+  bool read_something = false;
+
+  auto read_mem = [&read_something](string_view path, size_t* output) {
+    auto file = io::ReadFileToString(path);
+    DVLOG(1) << "container limits: read " << path << ": " << file.value_or("N/A");
+
+    size_t temp = numeric_limits<size_t>::max();
+
+    if (file.has_value()) {
+      if (!absl::StartsWith(*file, "max"))
+        CHECK(absl::SimpleAtoi(*file, &temp))
+            << "Failed in parsing cgroup limits, path: " << path << " (read: " << *file << ")";
+      read_something = true;
+    }
+
+    *output = min(*output, temp);
+  };
 
   string mem_path, cpu_path;
-  auto err = GetCGroupPath(&mem_path, &cpu_path);
+  GetCGroupPath(&mem_path, &cpu_path);
 
   if (mem_path.empty() || cpu_path.empty()) {
-    VLOG(1) << "Failed to get cgroup path, error: " << err;
+    VLOG(1) << "Failed to get cgroup path, error";
     return;
   }
 
-  auto original_memory = mdata->mem_total;
+  VLOG(1) << "mem_path = " << mem_path;
+  VLOG(1) << "cpu_path = " << cpu_path;
 
   /* Update memory limits */
-  auto mlimit = io::ReadFileToString(mem_path + "/memory.limit_in_bytes");
-  DVLOG(1) << "memory/memory.limit_in_bytes: " << mlimit.value_or("N/A");
 
-  if (mlimit && !absl::StartsWith(*mlimit, "max")) {
-    CHECK(absl::SimpleAtoi(*mlimit, &mdata->mem_total));
-  }
+  // Start by reading global memory limits
+  constexpr auto base_mem = "/sys/fs/cgroup/memory"sv;
+  read_mem(StrCat(base_mem, "/memory.limit_in_bytes"), &mdata->mem_total);
+  read_mem(StrCat(base_mem, "/memory.max"), &mdata->mem_total);
 
-  auto mmax = io::ReadFileToString(mem_path + "/memory.max");
-  DVLOG(1) << "memory.max: " << mmax.value_or("N/A");
+  // Read cgroup-specific limits
+  read_mem(StrCat(mem_path, "/memory.limit_in_bytes"), &mdata->mem_total);
+  read_mem(StrCat(mem_path, "/memory.max"), &mdata->mem_total);
+  read_mem(StrCat(mem_path, "/memory.high"), &mdata->mem_avail);
 
-  if (mmax && !absl::StartsWith(*mmax, "max")) {
-    CHECK(absl::SimpleAtoi(*mmax, &mdata->mem_total));
-  }
-
-  mdata->mem_avail = mdata->mem_total;
-  auto mhigh = io::ReadFileToString(mem_path + "/memory.high");
-
-  if (mhigh && !absl::StartsWith(*mhigh, "max")) {
-    CHECK(absl::SimpleAtoi(*mhigh, &mdata->mem_avail));
-  }
-
-  if (numeric_limits<size_t>::max() == mdata->mem_total)
-    mdata->mem_avail = original_memory;
+  mdata->mem_avail = min(mdata->mem_avail, mdata->mem_total);
 
   /* Update thread limits */
 
-  double count = 0, timeshare = 1;
+  constexpr auto base_cpu = "/sys/fs/cgroup/cpu"sv;
+  auto read_cpu = [&read_something](string_view path, size_t* output) {
+    double count{0}, timeshare{1};
 
-  if (auto cpu = ReadFileToString(cpu_path + "/cpu.max"); cpu.has_value()) {
-    vector<string_view> res = absl::StrSplit(cpu.value(), ' ');
+    /**
+     * Summarized: the function does one of the following:
+     *
+     * 1. read path/cpu.max -- for v2. The format of this file is:
+     *  $COUNT $PERIOD
+     * which indicates that we can use upto $COUNT shares in a $PERIOD of time.
+     * If $COUNT is max, then we can use as much CPU as the system has. Otherwise,
+     * this translates to $COUNT/$PERIOD threads.
+     *
+     * 2. read path/cpu.cfs_quota_us & path/cpu.cfs_period_us -- same idea, but for v1.
+     */
 
-    CHECK_EQ(res.size(), 2u);
+    if (auto cpu = ReadFileToString(StrCat(path, "/cpu.max")); cpu.has_value()) {
+      vector<string_view> res = absl::StrSplit(*cpu, ' ');
 
-    if (res[0] == "max")
-      *max_threads = 0u;
-    else {
-      CHECK(absl::SimpleAtod(res[0], &count));
-      CHECK(absl::SimpleAtod(res[1], &timeshare));
+      CHECK_EQ(res.size(), 2u);
 
-      *max_threads = static_cast<size_t>(ceil(count / timeshare));
+      if (res[0] == "max")
+        *output = 0u;
+      else {
+        CHECK(absl::SimpleAtod(res[0], &count))
+            << "Failed in parsing cgroupv2 cpu count, path = " << path << " (read: " << *cpu << ")";
+        CHECK(absl::SimpleAtod(res[1], &timeshare))
+            << "Failed in parsing cgroupv2 cpu timeshare, path = " << path << " (read: " << *cpu
+            << ")";
+
+        *output = static_cast<size_t>(ceil(count / timeshare));
+      }
+
+      read_something = true;
+
+    } else if (auto quota = ReadFileToString(StrCat(path, "/cpu.cfs_quota_us"));
+               quota.has_value()) {
+      auto period = ReadFileToString(StrCat(path, "/cpu.cfs_period_us"));
+
+      CHECK(period.has_value()) << "Failed to read cgroup cpu.cfs_period_us, but read "
+                                   "cpu.cfs_quota_us (this shouldn't happen!)";
+
+      CHECK(absl::SimpleAtod(quota.value(), &count))
+          << "Failed in parsing cgroupv1 cpu timeshare, quota = " << path << " (read: " << *quota
+          << ")";
+
+      if (count == -1)  // on -1 there is no limit.
+        count = 0;
+
+      CHECK(absl::SimpleAtod(period.value(), &timeshare))
+          << "Failed in parsing cgroupv1 cpu timeshare, path = " << path << " (read: " << *period
+          << ")";
+
+      *output = static_cast<size_t>(count / timeshare);
+      read_something = true;
     }
-  } else if (auto quota = ReadFileToString(cpu_path + "/cpu.cfs_quota_us"); quota.has_value()) {
-    auto period = ReadFileToString(cpu_path + "/cpu.cfs_period_us");
+  };
 
-    CHECK(period.has_value()) << "Failed to read cgroup cpu.cfs_period_us, but read cpu.cfs_quota "
-                                 "us (this shouldn't happen!)";
+  read_cpu(base_cpu, max_threads);  // global cpu limits
+  read_cpu(cpu_path, max_threads);  // cgroup-specific limits
 
-    CHECK(absl::SimpleAtod(quota.value(), &count));
-
-    if (count == -1)  // on -1 there is no limit.
-      count = 0;
-
-    CHECK(absl::SimpleAtod(period.value(), &timeshare));
-  } else {
-    *max_threads = 0u;  // cpuset, this is handled later.
-    return;
+  if (!read_something) {
+    LOG(ERROR) << "Failed in deducing any cgroup limits with paths " << mem_path << " and "
+               << cpu_path << ". Exiting.";
+    exit(1);
   }
-
-  *max_threads = static_cast<size_t>(ceil(count / timeshare));
 }
+
+#endif
 
 }  // namespace
 }  // namespace dfly
@@ -645,6 +729,46 @@ void PrintBasicUsageInfo() {
   std::cout << endl;
 }
 
+void ParseFlagsFromEnv() {
+  if (getenv("DFLY_PASSWORD")) {
+    LOG(WARNING)
+        << "DFLY_PASSWORD environment variable is being deprecated in favour of DFLY_requirepass";
+  }
+  // Allowed environment variable names that can have
+  // DFLY_ prefix, but don't necessarily have an ABSL flag created
+  absl::flat_hash_set<std::string_view> ignored_environment_flag_names = {"DEV_ENV", "PASSWORD"};
+  const auto& flags = absl::GetAllFlags();
+  for (char** env = environ; *env != nullptr; env++) {
+    constexpr string_view kPrefix = "DFLY_";
+    string_view environ_var = *env;
+    if (absl::StartsWith(environ_var, kPrefix)) {
+      // Per 'man environ', environment variables are included with their values
+      // in the format "name=value". Need to strip them apart, in order to work with flags object
+      pair<string_view, string_view> environ_pair =
+          absl::StrSplit(absl::StripPrefix(environ_var, kPrefix), absl::MaxSplits('=', 1));
+      const auto& [flag_name, flag_value] = environ_pair;
+      if (ignored_environment_flag_names.contains(flag_name)) {
+        continue;
+      }
+      auto entry = flags.find(flag_name);
+      if (entry != flags.end()) {
+        if (absl::flags_internal::WasPresentOnCommandLine(flag_name)) {
+          continue;
+        }
+        string error;
+        auto& flag = entry->second;
+        bool success = flag->ParseFrom(flag_value, &error);
+        if (!success) {
+          LOG(FATAL) << "could not parse flag " << flag->Name()
+                     << " from environment variable. Error: " << error;
+        }
+      } else {
+        LOG(FATAL) << "unknown environment variable DFLY_" << flag_name;
+      }
+    }
+  }
+}
+
 int main(int argc, char* argv[]) {
   absl::SetProgramUsageMessage(
       R"(a modern in-memory store.
@@ -663,8 +787,12 @@ Usage: dragonfly [FLAGS]
   };
 
   absl::SetFlagsUsageConfig(config);
+  google::InitGoogleLogging(argv[0]);
+  google::SetLogFilenameExtension(".log");
 
   MainInitGuard guard(&argc, &argv);
+
+  ParseFlagsFromEnv();
 
   PrintBasicUsageInfo();
   LOG(INFO) << "Starting dragonfly " << GetVersion() << "-" << kGitSha;
@@ -698,12 +826,14 @@ Usage: dragonfly [FLAGS]
     }
   }
 
-  auto memory = ReadMemInfo().value();
+  io::MemInfoData mem_info = ReadMemInfo().value_or(io::MemInfoData{});
   size_t max_available_threads = 0u;
 
-  UpdateResourceLimitsIfInsideContainer(&memory, &max_available_threads);
+#ifdef __linux__
+  UpdateResourceLimitsIfInsideContainer(&mem_info, &max_available_threads);
+#endif
 
-  if (memory.swap_total != 0)
+  if (mem_info.swap_total != 0)
     LOG(WARNING) << "SWAP is enabled. Consider disabling it when running Dragonfly.";
 
   dfly::max_memory_limit = dfly::GetMaxMemoryFlag();
@@ -711,8 +841,13 @@ Usage: dragonfly [FLAGS]
   if (dfly::max_memory_limit == 0) {
     LOG(INFO) << "maxmemory has not been specified. Deciding myself....";
 
-    size_t available = memory.mem_avail;
+    size_t available = mem_info.mem_avail;
     size_t maxmemory = size_t(0.8 * available);
+    if (maxmemory == 0) {
+      LOG(ERROR) << "Could not deduce how much memory available. "
+                 << "Use --maxmemory=... to specify explicitly";
+      return 1;
+    }
     LOG(INFO) << "Found " << HumanReadableNumBytes(available)
               << " available memory. Setting maxmemory to " << HumanReadableNumBytes(maxmemory);
 
@@ -720,23 +855,24 @@ Usage: dragonfly [FLAGS]
     dfly::max_memory_limit = maxmemory;
   } else {
     string hr_limit = HumanReadableNumBytes(dfly::max_memory_limit);
-    if (dfly::max_memory_limit > memory.mem_avail)
+    if (dfly::max_memory_limit > mem_info.mem_avail)
       LOG(WARNING) << "Got memory limit " << hr_limit << ", however only "
-                   << HumanReadableNumBytes(memory.mem_avail) << " was found.";
+                   << HumanReadableNumBytes(mem_info.mem_avail) << " was found.";
     LOG(INFO) << "Max memory limit is: " << hr_limit;
   }
 
   mi_option_enable(mi_option_show_errors);
   mi_option_set(mi_option_max_warnings, 0);
-  mi_option_set(mi_option_decommit_delay, 0);
+  mi_option_set(mi_option_decommit_delay, 1);
 
+  unique_ptr<util::ProactorPool> pool;
+
+#ifdef __linux__
   base::sys::KernelVersion kver;
   base::sys::GetKernelVersion(&kver);
 
   CHECK_LT(kver.major, 99u);
   dfly::kernel_version = kver.kernel * 100 + kver.major;
-
-  unique_ptr<util::ProactorPool> pool;
 
   bool use_epoll = ShouldUseEpollAPI(kver);
 
@@ -745,6 +881,9 @@ Usage: dragonfly [FLAGS]
   } else {
     pool.reset(fb2::Pool::IOUring(1024, max_available_threads));  // 1024 - iouring queue size.
   }
+#else
+  pool.reset(fb2::Pool::Epoll(max_available_threads));
+#endif
 
   pool->Run();
 

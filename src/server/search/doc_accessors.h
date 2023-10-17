@@ -5,6 +5,10 @@
 #pragma once
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/types/span.h>
+
+#include <string>
+#include <utility>
 
 #include "core/json_object.h"
 #include "core/search/search.h"
@@ -20,8 +24,12 @@ class StringMap;
 // behind a document interface for quering fields and serializing.
 // Field string_view's are only valid until the next is requested.
 struct BaseAccessor : public search::DocumentAccessor {
-  // Convert underlying type to a map<string, string> to be sent as a reply
-  virtual SearchDocData Serialize(search::Schema schema) const = 0;
+  // Convert the full underlying type to a map<string, string> to be sent as a reply
+  virtual SearchDocData Serialize(const search::Schema& schema) const = 0;
+
+  // Serialize selected fields
+  SearchDocData Serialize(const search::Schema& schema,
+                          const SearchParams::FieldReturnList& fields) const;
 };
 
 // Accessor for hashes stored with listpack
@@ -32,8 +40,8 @@ struct ListPackAccessor : public BaseAccessor {
   }
 
   std::string_view GetString(std::string_view field) const override;
-  search::FtVector GetVector(std::string_view field) const override;
-  SearchDocData Serialize(search::Schema schema) const override;
+  VectorInfo GetVector(std::string_view field) const override;
+  SearchDocData Serialize(const search::Schema& schema) const override;
 
  private:
   mutable std::array<uint8_t, 33> intbuf_[2];
@@ -46,8 +54,8 @@ struct StringMapAccessor : public BaseAccessor {
   }
 
   std::string_view GetString(std::string_view field) const override;
-  search::FtVector GetVector(std::string_view field) const override;
-  SearchDocData Serialize(search::Schema schema) const override;
+  VectorInfo GetVector(std::string_view field) const override;
+  SearchDocData Serialize(const search::Schema& schema) const override;
 
  private:
   StringMap* hset_;
@@ -55,16 +63,31 @@ struct StringMapAccessor : public BaseAccessor {
 
 // Accessor for json values
 struct JsonAccessor : public BaseAccessor {
-  explicit JsonAccessor(JsonType* json) : json_{json} {
+  struct JsonPathContainer;  // contains jsoncons::jsonpath::jsonpath_expression
+
+  explicit JsonAccessor(const JsonType* json) : json_{*json} {
   }
 
   std::string_view GetString(std::string_view field) const override;
-  search::FtVector GetVector(std::string_view field) const override;
-  SearchDocData Serialize(search::Schema schema) const override;
+  VectorInfo GetVector(std::string_view field) const override;
+  SearchDocData Serialize(const search::Schema& schema) const override;
+
+  // The JsonAccessor works with structured types and not plain strings, so an overload is needed
+  SearchDocData Serialize(const search::Schema& schema,
+                          const SearchParams::FieldReturnList& fields) const;
+
+  static void RemoveFieldFromCache(std::string_view field);
 
  private:
+  /// Parses `field` into a JSON path. Caches the results internally.
+  JsonPathContainer* GetPath(std::string_view field) const;
+
+  const JsonType& json_;
   mutable std::string buf_;
-  JsonType* json_;
+
+  // Contains built json paths to avoid parsing them repeatedly
+  static thread_local absl::flat_hash_map<std::string, std::unique_ptr<JsonPathContainer>>
+      path_cache_;
 };
 
 // Get accessor for value
