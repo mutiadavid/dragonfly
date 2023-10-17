@@ -95,7 +95,7 @@ containers:
             key: {{ .Values.passwordFromSecret.existingSecret.key }}
     {{- end }}
 
-{{- if or (.Values.tls.enabled) (.Values.extraVolumes) }}
+{{- if or (.Values.tls.enabled) (.Values.extraVolumes) (.Values.storage.enabled)}}
 volumes:
 {{- if and .Values.tls .Values.tls.enabled }}
   {{- if .Values.tls.existing_secret }}
@@ -111,6 +111,11 @@ volumes:
     secret:
       secretName: {{ include "dragonfly.fullname" . }}-tls
   {{- end }}
+{{- end }}
+{{- if .Values.storage.enabled}}
+  - name: "{{ .Release.Name }}-data"
+    persistentVolumeClaim:
+        claimName: "{{ .Release.Name }}-data"
 {{- end }}
 {{- with .Values.extraVolumes }}
   {{- toYaml . | trim | nindent 2 }}
